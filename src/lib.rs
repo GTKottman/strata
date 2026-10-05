@@ -30,8 +30,22 @@ pub struct Meters {
     pub engine_stats: [AtomicF32; 7],
     /// Result of "Measure latest export".
     pub file_report: Mutex<String>,
+    /// Event log for diagnostics (initialize, reset, transport, snapshots), newest last.
+    pub log: Mutex<std::collections::VecDeque<String>>,
     /// Text summary of the last balance plan, for the editor.
     pub plan_summary: Mutex<String>,
+}
+
+impl Meters {
+    /// Never blocks: if the editor holds the lock, the line is dropped.
+    pub fn push_log(&self, line: String) {
+        if let Ok(mut l) = self.log.try_lock() {
+            if l.len() >= 200 {
+                l.pop_front();
+            }
+            l.push_back(line);
+        }
+    }
 }
 
 impl Default for Meters {
@@ -51,6 +65,7 @@ impl Default for Meters {
             reset: AtomicBool::new(false),
             engine_stats: std::array::from_fn(|_| AtomicF32::new(0.0)),
             file_report: Mutex::new(String::new()),
+            log: Mutex::new(std::collections::VecDeque::new()),
             plan_summary: Mutex::new(String::new()),
         }
     }
@@ -68,6 +83,13 @@ pub struct Strata {
     inits: u32,
     resets: u32,
     fs: f64,
+    /// Sample rate the meters were built for (they survive re-initialization at the same rate).
+    meter_fs: f64,
+    /// Frames processed since the plugin was created (log clock).
+    clock: f64,
+    was_playing: bool,
+    next_snapshot: f64,
+    last_block: usize,
 }
 
 impl Strata {
@@ -454,6 +476,11 @@ impl Default for Strata {
             inits: 0,
             resets: 0,
             fs: 44100.0,
+            meter_fs: 0.0,
+            clock: 0.0,
+            was_playing: false,
+            next_snapshot: 0.0,
+            last_block: 0,
         }
     }
 }
@@ -490,8 +517,21 @@ impl Plugin for Strata {
         let fs = config.sample_rate as f64;
         self.fs = fs;
         self.chain = Chain::new(fs);
-        self.in_meter = LoudnessMeter::new(fs);
-        self.out_meter = LoudnessMeter::new(fs);
+        // Hosts re-initialize around offline renders; keep the measurements unless the rate changed.
+        let rebuilt = fs != self.meter_fs;
+        if rebuilt {
+            self.in_meter = LoudnessMeter::new(fs);
+            self.out_meter = LoudnessMeter::new(fs);
+            self.meter_fs = fs;
+        }
+        self.meters.push_log(format!(
+            "{:8.1}s init mode={:?} fs={} max_block={} meters {}",
+            self.clock / fs,
+            config.process_mode,
+            config.sample_rate,
+            config.max_buffer_size,
+            if rebuilt { "rebuilt" } else { "kept" }
+        ));
         self.corr_coef = (-1.0 / (0.3 * fs)).exp();
         context.set_latency_samples(self.chain.latency() as u32);
         self.inits += 1;
@@ -501,6 +541,7 @@ impl Plugin for Strata {
     fn reset(&mut self) {
         self.corr = [0.0; 3];
         self.resets += 1;
+        self.meters.push_log(format!("{:8.1}s reset", self.clock / self.fs.max(1.0)));
     }
 
     fn process(&mut self, buffer: &mut Buffer, _aux: &mut AuxiliaryBuffers, context: &mut impl ProcessContext<Self>) -> ProcessStatus {
@@ -511,9 +552,26 @@ impl Plugin for Strata {
             self.st = [0.0, 0.0, 0.0, f64::INFINITY, f64::NEG_INFINITY];
             self.inits = 0;
             self.resets = 0;
+            self.meters.push_log(format!("{:8.1}s meters reset", self.clock / self.fs));
         }
         let t = context.transport();
         let n = buffer.samples() as f64;
+        let now = self.clock / self.fs;
+        self.clock += n;
+        if t.playing != self.was_playing {
+            self.was_playing = t.playing;
+            self.meters.push_log(format!(
+                "{now:8.1}s {} at beat {:.2} ({} bpm, block {})",
+                if t.playing { "play" } else { "stop" },
+                t.pos_beats().unwrap_or(-1.0),
+                t.tempo.unwrap_or(-1.0),
+                buffer.samples()
+            ));
+        }
+        if buffer.samples() != self.last_block && t.playing {
+            self.meters.push_log(format!("{now:8.1}s block size {} -> {}", self.last_block, buffer.samples()));
+        }
+        self.last_block = buffer.samples();
         self.st[0] += n;
         if t.playing {
             self.st[1] += n;
@@ -530,8 +588,11 @@ impl Plugin for Strata {
         let (left, right) = channels.split_at_mut(1);
         let (left, right) = (&mut *left[0], &mut *right[0]);
 
+        let metering = t.playing;
         for (l, r) in left.iter().zip(right.iter()) {
-            self.in_meter.process(*l as f64, *r as f64);
+            if metering {
+                self.in_meter.process(*l as f64, *r as f64);
+            }
             self.st[2] += 0.5 * (*l as f64 * *l as f64 + *r as f64 * *r as f64);
         }
         let fs = self.out_meter_fs();
@@ -553,6 +614,9 @@ impl Plugin for Strata {
         let a = self.corr_coef;
         for (l, r) in left.iter().zip(right.iter()) {
             let (l, r) = (*l as f64, *r as f64);
+            if !metering {
+                continue;
+            }
             self.out_meter.process(l, r);
             self.corr[0] = a * self.corr[0] + (1.0 - a) * l * r;
             self.corr[1] = a * self.corr[1] + (1.0 - a) * l * l;
@@ -572,6 +636,19 @@ impl Plugin for Strata {
         m.correlation.store(if denom > 1e-12 { (self.corr[0] / denom) as f32 } else { 0.0 }, st);
         m.glue_gr.store(report.glue_gr_db as f32, st);
         m.limiter_gr.store(report.limiter_gr_db as f32, st);
+        if metering {
+            self.next_snapshot -= n;
+            if self.next_snapshot <= 0.0 {
+                self.next_snapshot = 10.0 * self.fs;
+                self.meters.push_log(format!(
+                    "{now:8.1}s beat {:6.1}  in {:+.1}  out {:+.1} LUFS  out TP {:+.2}",
+                    t.pos_beats().unwrap_or(-1.0),
+                    self.in_meter.integrated(),
+                    self.out_meter.integrated(),
+                    to_db(self.out_meter.true_peak_max)
+                ));
+            }
+        }
 
         ProcessStatus::Normal
     }

@@ -218,6 +218,10 @@ fn meter_panel(ui: &mut egui::Ui, p: &StrataParams, m: &Meters, setter: &ParamSe
         if !fr.is_empty() {
             ui.label(RichText::new(fr).monospace().size(11.0));
         }
+        ui.add_space(4.0);
+        ui.label(RichText::new("Event log (newest last)").color(DIM));
+        let lines: Vec<String> = m.log.lock().map(|l| l.iter().rev().take(24).rev().cloned().collect()).unwrap_or_default();
+        ui.label(RichText::new(lines.join("\n")).monospace().size(11.0));
     });
 }
 

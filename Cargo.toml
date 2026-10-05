@@ -1,6 +1,6 @@
 [package]
 name = "strata"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 description = "Mastering with adjustment layers: Tone, Glue, Warmth, Width and a true-peak limiter, with loudness meters"
 license = "GPL-3.0-or-later"
