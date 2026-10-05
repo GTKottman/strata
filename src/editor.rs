@@ -258,6 +258,21 @@ fn balance_panel(ui: &mut egui::Ui, p: &StrataParams, m: &Meters, setter: &Param
                 .monospace(),
             );
         }
+        ui.add_space(4.0);
+        ui.label(RichText::new("Pass statistics (since Reset meters)").color(DIM));
+        let mut head = format!("{:<4}", "#");
+        for n in crate::cylinder::STAT_NAMES {
+            head += &format!("{n:>8}");
+        }
+        ui.label(RichText::new(head).monospace().size(11.0));
+        for c in &sorted {
+            let mut line = format!("{:<4}", c.id);
+            for (i, a) in c.stats.iter().enumerate() {
+                let v = a.load(Ordering::Relaxed);
+                line += &if i == 8 { format!("{:>8.0}", v) } else { format!("{:>8.1}", v) };
+            }
+            ui.label(RichText::new(line).monospace().size(11.0));
+        }
         let summary = m.plan_summary.lock().unwrap().clone();
         if !summary.is_empty() {
             ui.add_space(4.0);

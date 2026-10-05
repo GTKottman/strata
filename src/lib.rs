@@ -402,6 +402,7 @@ impl Plugin for Strata {
 
     fn process(&mut self, buffer: &mut Buffer, _aux: &mut AuxiliaryBuffers, _context: &mut impl ProcessContext<Self>) -> ProcessStatus {
         if self.meters.reset.swap(false, Ordering::Relaxed) {
+            cylinder::STATS_GEN.fetch_add(1, Ordering::Relaxed);
             self.in_meter.reset();
             self.out_meter.reset();
         }

@@ -27,6 +27,9 @@ pub static BALANCE_ON: AtomicBool = AtomicBool::new(true);
 /// Beats per bar as last seen by any instance (for the report).
 pub static BEATS_PER_BAR: AtomicU32 = AtomicU32::new(4);
 
+/// Bumped by the Engine's "Reset meters": every Cylinder restarts its pass statistics.
+pub static STATS_GEN: AtomicU32 = AtomicU32::new(0);
+
 static NEXT_ID: AtomicU32 = AtomicU32::new(1);
 static REGISTRY: Mutex<Vec<Weak<CylShared>>> = Mutex::new(Vec::new());
 
@@ -56,6 +59,8 @@ pub struct CylShared {
     pub curve_len: AtomicU32,
     pub static_db: AtomicF32,
     pub live_gain_db: AtomicF32,
+    /// Statistics since the last meter reset (diagnostics).
+    pub stats: [AtomicF32; STAT_COUNT],
     pub role: AtomicU32,
     pub state: Arc<Mutex<CylState>>,
 }
@@ -75,6 +80,7 @@ impl CylShared {
             curve_len: AtomicU32::new(0),
             static_db: AtomicF32::new(0.0),
             live_gain_db: AtomicF32::new(0.0),
+            stats: std::array::from_fn(|_| AtomicF32::new(0.0)),
             role: AtomicU32::new(0),
             state,
         }
@@ -112,6 +118,45 @@ impl CylShared {
             v.iter().for_each(|a| a.store(0.0, Ordering::Relaxed));
         }
         self.learned_beats.store(0, Ordering::Relaxed);
+    }
+}
+
+// ---- pass statistics ----
+
+pub const STAT_COUNT: usize = 9;
+pub const STAT_NAMES: [&str; STAT_COUNT] = ["sec", "play%", "in dB", "out dB", "gain", "pos0", "pos1", "bpm", "rate"];
+
+/// Accumulated on the audio thread, published to `CylShared::stats` once per block.
+#[derive(Default)]
+struct PassStats {
+    frames: f64,
+    playing: f64,
+    in_sq: f64,
+    out_sq: f64,
+    gain_db: f64,
+    pos_min: f64,
+    pos_max: f64,
+    tempo: f64,
+}
+
+impl PassStats {
+    fn publish(&self, fs: f64, out: &[AtomicF32; STAT_COUNT]) {
+        let n = self.frames.max(1.0);
+        let db = |x: f64| if x > 0.0 { 10.0 * (x / n).log10() } else { -200.0 };
+        let v = [
+            self.frames / fs,
+            100.0 * self.playing / n,
+            db(self.in_sq),
+            db(self.out_sq),
+            self.gain_db / n,
+            if self.pos_min.is_finite() { self.pos_min } else { -1.0 },
+            if self.pos_max.is_finite() { self.pos_max } else { -1.0 },
+            self.tempo,
+            fs,
+        ];
+        for (a, x) in out.iter().zip(v) {
+            a.store(x as f32, Ordering::Relaxed);
+        }
     }
 }
 
@@ -241,6 +286,8 @@ pub struct StrataCylinder {
     features: Features,
     fs: f64,
     seen_gen: u32,
+    seen_stats: u32,
+    stats: PassStats,
     cur_beat: i64,
     gain_db: f64,
     gain_a: f64,
@@ -260,6 +307,8 @@ impl Default for StrataCylinder {
             cur_beat: -1,
             gain_db: 0.0,
             gain_a: 0.0,
+            seen_stats: u32::MAX,
+            stats: PassStats::default(),
         }
     }
 }
@@ -366,6 +415,12 @@ impl Plugin for StrataCylinder {
             self.features.take();
         }
 
+        let sgen = STATS_GEN.load(Ordering::Relaxed);
+        if sgen != self.seen_stats {
+            self.seen_stats = sgen;
+            self.stats = PassStats { pos_min: f64::INFINITY, pos_max: f64::NEG_INFINITY, ..Default::default() };
+        }
+
         let t = context.transport();
         if let Some(n) = t.time_sig_numerator {
             if n > 0 {
@@ -422,7 +477,21 @@ impl Plugin for StrataCylinder {
             for s in frame.iter_mut() {
                 *s *= g;
             }
+
+            let st = &mut self.stats;
+            st.frames += 1.0;
+            st.in_sq += 0.5 * (l * l + r * r);
+            st.out_sq += 0.5 * (l * l + r * r) * (g as f64) * (g as f64);
+            st.gain_db += self.gain_db;
+            if let Some(p0) = pos {
+                let p = p0 + i as f64 * beats_per_sample;
+                st.playing += 1.0;
+                st.pos_min = st.pos_min.min(p);
+                st.pos_max = st.pos_max.max(p);
+            }
         }
+        self.stats.tempo = t.tempo.unwrap_or(-1.0);
+        self.stats.publish(self.fs, &sh.stats);
         sh.live_gain_db.store(self.gain_db as f32, Ordering::Relaxed);
         ProcessStatus::Normal
     }
