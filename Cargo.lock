@@ -1697,11 +1697,13 @@ dependencies = [
 
 [[package]]
 name = "strata"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "hound",
  "nih_plug",
  "nih_plug_egui",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

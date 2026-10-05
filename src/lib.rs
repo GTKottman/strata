@@ -1,14 +1,16 @@
 //! Strata: mastering with adjustment layers.
 
+pub mod cylinder;
 pub mod dsp;
 mod editor;
+pub mod orchestra;
 
 use dsp::meter::LoudnessMeter;
 use dsp::{pack_order, unpack_order, Chain, Settings, DEFAULT_ORDER};
 use nih_plug::prelude::*;
 use nih_plug_egui::EguiState;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// Measurements shared with the editor. Loudness in LUFS, peaks in dBTP, reductions in dB.
 pub struct Meters {
@@ -23,6 +25,8 @@ pub struct Meters {
     pub glue_gr: AtomicF32,
     pub limiter_gr: AtomicF32,
     pub reset: AtomicBool,
+    /// Text summary of the last balance plan, for the editor.
+    pub plan_summary: Mutex<String>,
 }
 
 impl Default for Meters {
@@ -40,6 +44,7 @@ impl Default for Meters {
             glue_gr: AtomicF32::new(0.0),
             limiter_gr: AtomicF32::new(0.0),
             reset: AtomicBool::new(false),
+            plan_summary: Mutex::new(String::new()),
         }
     }
 }
@@ -143,6 +148,16 @@ pub struct StrataParams {
     #[id = "lim_release"]
     pub limiter_release: FloatParam,
 
+    /// Engine: follow the balance plan in every Cylinder.
+    #[id = "bal_on"]
+    pub balance_on: BoolParam,
+    /// Engine: how much of the static (whole-song) level balance to apply.
+    #[id = "bal_static"]
+    pub balance_static: FloatParam,
+    /// Engine: how much of the moment-by-moment balance to apply.
+    #[id = "bal_moments"]
+    pub balance_moments: FloatParam,
+
     /// Loudness target used by the editor's "gain to target" readout.
     #[id = "target"]
     pub target_lufs: FloatParam,
@@ -152,7 +167,7 @@ impl Default for StrataParams {
     fn default() -> Self {
         let d = Settings::default();
         Self {
-            editor_state: EguiState::from_size(980, 640),
+            editor_state: EguiState::from_size(1040, 760),
             layer_order: Arc::new(AtomicU32::new(pack_order(DEFAULT_ORDER))),
 
             tone_on: BoolParam::new("Tone On", d.tone.on),
@@ -189,6 +204,10 @@ impl Default for StrataParams {
             limiter_gain: db_param("Input Gain", 0.0, 0.0, 24.0),
             limiter_ceiling: db_param("Ceiling (dBTP)", d.limiter.ceiling_db as f32, -3.0, 0.0),
             limiter_release: ms_param("Limiter Release", d.limiter.release_ms as f32, 10.0, 500.0),
+
+            balance_on: BoolParam::new("Balance On", true),
+            balance_static: opacity_param("Static Balance", 1.0),
+            balance_moments: opacity_param("Moments", 1.0),
 
             target_lufs: FloatParam::new("Target", -14.0, FloatRange::Linear { min: -24.0, max: -6.0 })
                 .with_unit(" LUFS")
@@ -236,6 +255,93 @@ impl StrataParams {
             },
         }
     }
+}
+
+/// Run the balance plan over everything the Cylinders learned, install it, write the report.
+pub fn balance_now() -> String {
+    let cyls = cylinders_sorted();
+    if cyls.is_empty() {
+        return "No Cylinders found. Put a Strata Cylinder on each channel.".into();
+    }
+    let inputs: Vec<orchestra::TrackInput> = cyls
+        .iter()
+        .map(|c| {
+            let n = c.learned_beats.load(Ordering::Relaxed) as usize;
+            let read = |v: &Vec<AtomicF32>| v[..n].iter().map(|a| a.load(Ordering::Relaxed)).collect::<Vec<f32>>();
+            let role = orchestra::Role::from_index(c.role.load(Ordering::Relaxed));
+            orchestra::TrackInput {
+                id: c.id,
+                label: c.label(),
+                role: (role != orchestra::Role::Auto).then_some(role),
+                energy: read(&c.energy),
+                onsets: read(&c.onsets),
+                low: read(&c.low),
+                mid: read(&c.mid),
+                high: read(&c.high),
+            }
+        })
+        .collect();
+    if inputs.iter().all(|t| t.energy.is_empty()) {
+        return "Nothing learned yet: start learning, play the song, then balance.".into();
+    }
+    let bpb = cylinder::BEATS_PER_BAR.load(Ordering::Relaxed) as usize;
+    let plan = orchestra::plan(&inputs, bpb);
+    for (c, r) in cyls.iter().zip(&plan.tracks) {
+        c.set_plan(r.static_db as f32, &r.curve_db);
+    }
+    let mut text = String::new();
+    for r in &plan.tracks {
+        let name = if r.label.is_empty() { format!("#{}", r.id) } else { r.label.clone() };
+        text += &format!(
+            "{name:<14} {:<8}{} {:>6.1} dB loud  static {:+5.1}\n",
+            r.role.name(),
+            if r.role_guessed { "?" } else { " " },
+            r.loudness_db,
+            r.static_db
+        );
+    }
+    text += &format!("{} moments over {} bars\n", plan.moments.len(), plan.beats.div_ceil(plan.beats_per_bar));
+    for m in plan.moments.iter().take(12) {
+        text += &format!(
+            "bars {:>3}-{:<3} up: {}  back: {}\n",
+            m.from_bar,
+            m.to_bar,
+            if m.featured.is_empty() { "-".into() } else { m.featured.join(", ") },
+            if m.sitting_back.is_empty() { "-".into() } else { m.sitting_back.join(", ") }
+        );
+    }
+    match write_report(&plan) {
+        Ok(path) => text += &format!("report: {path}"),
+        Err(e) => text += &format!("report not written: {e}"),
+    }
+    text
+}
+
+fn cylinders_sorted() -> Vec<Arc<cylinder::CylShared>> {
+    let mut c = cylinder::cylinders();
+    c.sort_by_key(|c| c.id);
+    c
+}
+
+fn write_report(plan: &orchestra::Plan) -> std::io::Result<String> {
+    let home = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).unwrap_or_else(|_| ".".into());
+    let dir = std::path::Path::new(&home).join("Documents").join("Strata");
+    std::fs::create_dir_all(&dir)?;
+    let mut value = serde_json::to_value(plan).map_err(std::io::Error::other)?;
+    // Curves per bar (mean dB) so the report stays readable.
+    if let Some(tracks) = value.get_mut("tracks").and_then(|t| t.as_array_mut()) {
+        for (t, r) in tracks.iter_mut().zip(&plan.tracks) {
+            let per_bar: Vec<f32> = r
+                .curve_db
+                .chunks(plan.beats_per_bar.max(1))
+                .map(|c| (c.iter().sum::<f32>() / c.len() as f32 * 10.0).round() / 10.0)
+                .collect();
+            t["curve_db_per_bar"] = serde_json::json!(per_bar);
+        }
+    }
+    let path = dir.join("report.json");
+    std::fs::write(&path, serde_json::to_string_pretty(&value).map_err(std::io::Error::other)?)?;
+    Ok(path.display().to_string())
 }
 
 impl Default for Strata {
@@ -299,6 +405,9 @@ impl Plugin for Strata {
             self.in_meter.reset();
             self.out_meter.reset();
         }
+        cylinder::BALANCE_ON.store(self.params.balance_on.value(), Ordering::Relaxed);
+        cylinder::STATIC_AMOUNT.store(self.params.balance_static.value(), Ordering::Relaxed);
+        cylinder::MOMENT_AMOUNT.store(self.params.balance_moments.value(), Ordering::Relaxed);
         let settings = self.params.settings();
         let channels = buffer.as_slice();
         let (left, right) = channels.split_at_mut(1);
@@ -348,5 +457,5 @@ impl Vst3Plugin for Strata {
     const VST3_SUBCATEGORIES: &'static [Vst3SubCategory] = &[Vst3SubCategory::Fx, Vst3SubCategory::Mastering];
 }
 
-nih_export_clap!(Strata);
-nih_export_vst3!(Strata);
+nih_export_clap!(Strata, cylinder::StrataCylinder);
+nih_export_vst3!(Strata, cylinder::StrataCylinder);

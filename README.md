@@ -17,8 +17,33 @@ VST3 and CLAP, 64-bit Windows (built here by cross-compiling from Linux). Linux 
 | Width | Mid/side width with bass to mono | Width 0–200 %, Mono below |
 | Limiter (out) | Lookahead true-peak limiter, 1.5 ms lookahead | Input gain, Ceiling (dBTP), Release |
 
-Use ▲/▼ on a layer to move it. Opacity changes and on/off are ramped, so they never click.
+Use Up/Down on a layer to move it. Opacity changes and on/off are ramped, so they never click.
 Latency is reported to the host (1.5 ms + 12 samples).
+
+## Engine + Cylinders (auto-balance)
+
+The DLL holds two plugins. **Strata** on the Master is the Engine; **Strata Cylinder** goes on every
+instrument's mixer track (first insert slot). They find each other inside the host process.
+
+1. Put a Cylinder on each channel. Give it a name and a role (Drums, Bass, Lead, Keys, Pad, Texture),
+   or leave Auto and it guesses from what it hears.
+2. In the Engine's BALANCE card press **Start learning**, play the whole song from the start, then
+   **Stop learning + Balance**.
+3. Each Cylinder now plays back its plan, locked to the song position:
+   - **Static balance**: whole-song level towards a role template (drums 0, bass -2, lead -1,
+     keys -5, pad -9, texture -15 dB relative to the mix), at most +-9 dB.
+   - **Moments**, per beat among the melodic parts: one part moving alone (a solo or near-solo) +3 dB,
+     two moving +1.5 dB each, crowded sections (4+) keep only the busiest forward and pull the rest
+     back 1.5 dB; held drones/pads/texture sit back 1.5 dB while something moves. Drums and bass are
+     left alone. Smoothed over 3 beats, read a quarter beat ahead.
+4. Scale both with the Static balance and Moments sliders, switch the plan off with the BALANCE
+   toggle, or per channel with "Follow Engine". Plans are saved with the project.
+
+Each balance writes `Documents\Strata\report.json`: every channel's role, loudness, static offset and
+per-bar curve, plus the list of moments (bars, who is featured, who sits back).
+
+Cylinders adjust their own gain; FL's faders still apply after them, so set faders to 0 dB if you
+want the Engine to own the balance.
 
 ## Meters
 

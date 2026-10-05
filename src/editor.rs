@@ -26,14 +26,17 @@ pub fn create(params: Arc<StrataParams>, meters: Arc<Meters>) -> Option<Box<dyn 
                 .show(ctx, |ui| {
                     ui.horizontal(|ui| {
                         ui.label(RichText::new("STRATA").size(20.0).strong().color(ACCENT));
-                        ui.label(RichText::new("mastering layers").color(DIM));
+                        ui.label(RichText::new("engine · mastering layers").color(DIM));
                     });
                     ui.add_space(8.0);
                     ui.columns(2, |cols| {
                         egui::ScrollArea::vertical().id_salt("layers").show(&mut cols[0], |ui| {
                             layers(ui, &params, setter);
                         });
-                        meter_panel(&mut cols[1], &params, &meters, setter);
+                        egui::ScrollArea::vertical().id_salt("right").show(&mut cols[1], |ui| {
+                            meter_panel(ui, &params, &meters, setter);
+                            balance_panel(ui, &params, &meters, setter);
+                        });
                     });
                 });
             ctx.request_repaint();
@@ -80,10 +83,10 @@ fn layers(ui: &mut egui::Ui, p: &StrataParams, setter: &ParamSetter) {
                 toggle(ui, on, setter);
                 ui.label(RichText::new(format!("{}  {}", slot + 1, kind.name())).size(15.0).strong());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.add_enabled(slot < 3, egui::Button::new("▼")).on_hover_text("Move down").clicked() {
+                    if ui.add_enabled(slot < 3, egui::Button::new("Down")).on_hover_text("Move this layer down").clicked() {
                         swap = Some((slot, slot + 1));
                     }
-                    if ui.add_enabled(slot > 0, egui::Button::new("▲")).on_hover_text("Move up").clicked() {
+                    if ui.add_enabled(slot > 0, egui::Button::new("Up")).on_hover_text("Move this layer up").clicked() {
                         swap = Some((slot, slot - 1));
                     }
                 });
@@ -134,8 +137,9 @@ fn layers(ui: &mut egui::Ui, p: &StrataParams, setter: &ParamSetter) {
     }
 }
 
+/// Readings below -70 (the BS.1770 absolute gate) show as -inf, so silence never prints -539.6.
 fn fmt(v: f32, decimals: usize) -> String {
-    if v.is_finite() { format!("{v:+.decimals$}") } else { "  -inf".to_string() }
+    if v.is_finite() && v > -70.0 { format!("{v:+.decimals$}") } else { "  -inf".to_string() }
 }
 
 fn big(ui: &mut egui::Ui, label: &str, value: String, unit: &str, color: Color32) {
@@ -180,7 +184,7 @@ fn meter_panel(ui: &mut egui::Ui, p: &StrataParams, m: &Meters, setter: &ParamSe
             row(ui, "Target", &p.target_lufs, setter);
         });
         let target = p.target_lufs.value();
-        if out_i.is_finite() {
+        if out_i.is_finite() && out_i > -70.0 {
             let delta = target - out_i;
             ui.label(RichText::new(format!("Gain to target: {delta:+.1} dB")).monospace().size(18.0));
             let new_gain = (p.limiter_gain.value() + delta).clamp(0.0, 24.0);
@@ -197,6 +201,67 @@ fn meter_panel(ui: &mut egui::Ui, p: &StrataParams, m: &Meters, setter: &ParamSe
         ui.add_space(4.0);
         if ui.button("Reset meters").clicked() {
             m.reset.store(true, Ordering::Relaxed);
+        }
+    });
+}
+
+fn balance_panel(ui: &mut egui::Ui, p: &StrataParams, m: &Meters, setter: &ParamSetter) {
+    use crate::cylinder::{self, LEARNING, LEARN_GEN};
+    card(ui, |ui| {
+        ui.horizontal(|ui| {
+            toggle(ui, &p.balance_on, setter);
+            ui.label(RichText::new("BALANCE").strong().color(ACCENT));
+            ui.label(RichText::new("engine + cylinders").color(DIM));
+        });
+        let cyls = cylinder::cylinders();
+        let learning = LEARNING.load(Ordering::Relaxed);
+        ui.horizontal(|ui| {
+            if !learning {
+                if ui.button("Start learning").on_hover_text("Clears what the Cylinders learned; then play the whole song").clicked() {
+                    LEARN_GEN.fetch_add(1, Ordering::Relaxed);
+                    LEARNING.store(true, Ordering::Relaxed);
+                }
+            } else if ui.button("Stop learning + Balance").clicked() {
+                LEARNING.store(false, Ordering::Relaxed);
+                *m.plan_summary.lock().unwrap() = crate::balance_now();
+            }
+            if ui.add_enabled(!learning, egui::Button::new("Balance again")).clicked() {
+                *m.plan_summary.lock().unwrap() = crate::balance_now();
+            }
+            if ui.button("Clear plan").clicked() {
+                cyls.iter().for_each(|c| c.clear_plan());
+                *m.plan_summary.lock().unwrap() = "Plan cleared.".into();
+            }
+        });
+        if learning {
+            ui.label(RichText::new("LEARNING: play the whole song from the start").color(ACCENT).strong());
+        }
+        egui::Grid::new("bal").num_columns(2).spacing([10.0, 4.0]).show(ui, |ui| {
+            row(ui, "Static balance", &p.balance_static, setter);
+            row(ui, "Moments", &p.balance_moments, setter);
+        });
+        ui.add_space(4.0);
+        ui.label(RichText::new(format!("{} cylinders", cyls.len())).color(DIM));
+        let mut sorted = cyls.clone();
+        sorted.sort_by_key(|c| c.id);
+        for c in &sorted {
+            let label = c.label();
+            let name = if label.is_empty() { format!("#{}", c.id) } else { format!("#{} {}", c.id, label) };
+            ui.label(
+                RichText::new(format!(
+                    "{:<18} {:<8} learned {:>4}  gain {:+5.1} dB",
+                    name,
+                    crate::orchestra::Role::from_index(c.role.load(Ordering::Relaxed)).name(),
+                    c.learned_beats.load(Ordering::Relaxed),
+                    c.live_gain_db.load(Ordering::Relaxed)
+                ))
+                .monospace(),
+            );
+        }
+        let summary = m.plan_summary.lock().unwrap().clone();
+        if !summary.is_empty() {
+            ui.add_space(4.0);
+            ui.label(RichText::new(summary).monospace().size(11.0));
         }
     });
 }
