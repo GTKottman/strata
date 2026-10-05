@@ -4,7 +4,7 @@
 //! Rules (all in dB, before the Engine's amount scaling):
 //! - Static balance: each channel's loudness while playing is moved towards a role template
 //!   (drums 0, bass -2, lead -1, keys -5, pad -9, texture -15, relative to the mix), clamped to +-9.
-//! - Moments, per beat, among melodic parts (lead, keys, pad):
+//! - Moments, per beat. Only lead and keys parts can be "moving" (pads/texture are beds by role):
 //!   one part moving = solo moment +3; two moving +1.5 each; three moving: the busiest +1;
 //!   four or more (crowded): the busiest +1, the other movers -1.5.
 //!   Sustained parts (drones, pads, held chords, texture) sit back -1.5 while something moves.
@@ -63,6 +63,12 @@ impl Role {
 
     fn melodic(self) -> bool {
         matches!(self, Role::Lead | Role::Keys | Role::Pad)
+    }
+
+    /// Only these can be featured as "moving". Pads and textures are beds by role, so a tremolo or
+    /// LFO on a drone (which looks like a stream of attacks) never makes it a solo.
+    fn can_move(self) -> bool {
+        matches!(self, Role::Lead | Role::Keys)
     }
 }
 
@@ -196,7 +202,7 @@ pub fn plan(tracks: &[TrackInput], beats_per_bar: usize) -> Plan {
     let mut raw = vec![vec![0.0f32; beats]; padded.len()];
     for b in 0..beats {
         let moving: Vec<usize> = (0..padded.len())
-            .filter(|&i| actives[i][b] && roles[i].0.melodic() && padded[i].onsets[b] >= MOVING_ONSETS)
+            .filter(|&i| actives[i][b] && roles[i].0.can_move() && padded[i].onsets[b] >= MOVING_ONSETS)
             .collect();
         let beds: Vec<usize> = (0..padded.len())
             .filter(|&i| actives[i][b] && !moving.contains(&i) && (roles[i].0.melodic() || roles[i].0 == Role::Texture))
@@ -304,6 +310,15 @@ mod tests {
         assert!(cello_c[10] < 1.5, "cello not boosted when 3 parts move: {}", cello_c[10]);
         assert!(p.tracks[1].curve_db[2] < -1.0, "drone sits back under the solo");
         assert!(!p.moments.is_empty());
+    }
+
+    #[test]
+    fn tremolo_pad_is_never_featured_over_a_lead() {
+        // Organ pedal with tremolo: lots of "attacks" every beat. Cello lead holds long notes (no attacks).
+        let organ = track(1, Role::Pad, vec![0.1; 9], vec![3.0; 9]);
+        let cello = track(2, Role::Lead, vec![0.1; 9], vec![0.0; 9]);
+        let p = plan(&[organ, cello], 3);
+        assert!(p.tracks[0].curve_db.iter().all(|c| *c <= 0.0), "organ boosted: {:?}", p.tracks[0].curve_db);
     }
 
     #[test]

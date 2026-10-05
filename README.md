@@ -32,7 +32,7 @@ instrument's mixer track (first insert slot). They find each other inside the ho
 3. Each Cylinder now plays back its plan, locked to the song position:
    - **Static balance**: whole-song level towards a role template (drums 0, bass -2, lead -1,
      keys -5, pad -9, texture -15 dB relative to the mix), at most +-9 dB.
-   - **Moments**, per beat among the melodic parts: one part moving alone (a solo or near-solo) +3 dB,
+   - **Moments**, per beat; only Lead and Keys parts can be featured (Pad and Texture are always beds): one part moving alone (a solo or near-solo) +3 dB,
      two moving +1.5 dB each, crowded sections (4+) keep only the busiest forward and pull the rest
      back 1.5 dB; held drones/pads/texture sit back 1.5 dB while something moves. Drums and bass are
      left alone. Smoothed over 3 beats, read a quarter beat ahead.
