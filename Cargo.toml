@@ -1,0 +1,18 @@
+[package]
+name = "strata"
+version = "0.1.0"
+edition = "2021"
+description = "Mastering with adjustment layers: Tone, Glue, Warmth, Width and a true-peak limiter, with loudness meters"
+license = "GPL-3.0-or-later"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git" }
+nih_plug_egui = { git = "https://github.com/robbert-vdh/nih-plug.git" }
+hound = "3.5"
+
+[profile.release]
+lto = "thin"
+strip = "symbols"
