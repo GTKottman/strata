@@ -568,10 +568,11 @@ impl Plugin for Strata {
                 buffer.samples()
             ));
         }
-        if buffer.samples() != self.last_block && t.playing {
-            self.meters.push_log(format!("{now:8.1}s block size {} -> {}", self.last_block, buffer.samples()));
+        // Only new maximum block sizes: FL renders in alternating 417/418-sample blocks, which would flood the log.
+        if buffer.samples() > self.last_block && t.playing {
+            self.meters.push_log(format!("{now:8.1}s block size up to {}", buffer.samples()));
+            self.last_block = buffer.samples();
         }
-        self.last_block = buffer.samples();
         self.st[0] += n;
         if t.playing {
             self.st[1] += n;
