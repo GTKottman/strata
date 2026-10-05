@@ -25,6 +25,11 @@ pub struct Meters {
     pub glue_gr: AtomicF32,
     pub limiter_gr: AtomicF32,
     pub reset: AtomicBool,
+    /// Engine pass statistics since the last meter reset: seconds, playing %, input mean-square dB,
+    /// first and last song position (beats), initialize() calls, reset() calls.
+    pub engine_stats: [AtomicF32; 7],
+    /// Result of "Measure latest export".
+    pub file_report: Mutex<String>,
     /// Text summary of the last balance plan, for the editor.
     pub plan_summary: Mutex<String>,
 }
@@ -44,6 +49,8 @@ impl Default for Meters {
             glue_gr: AtomicF32::new(0.0),
             limiter_gr: AtomicF32::new(0.0),
             reset: AtomicBool::new(false),
+            engine_stats: std::array::from_fn(|_| AtomicF32::new(0.0)),
+            file_report: Mutex::new(String::new()),
             plan_summary: Mutex::new(String::new()),
         }
     }
@@ -57,6 +64,16 @@ pub struct Strata {
     out_meter: LoudnessMeter,
     corr: [f64; 3],
     corr_coef: f64,
+    st: [f64; 5], // frames, playing frames, input sum of squares, pos min, pos max
+    inits: u32,
+    resets: u32,
+    fs: f64,
+}
+
+impl Strata {
+    fn out_meter_fs(&self) -> f64 {
+        self.fs
+    }
 }
 
 fn db_param(name: &str, default: f32, min: f32, max: f32) -> FloatParam {
@@ -317,6 +334,85 @@ pub fn balance_now() -> String {
     text
 }
 
+/// Find the newest .wav under Documents\\Image-Line\\FL Studio\\Projects (two levels deep) and measure it.
+pub fn measure_latest_export() -> String {
+    let home = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).unwrap_or_else(|_| ".".into());
+    let root = std::path::Path::new(&home).join("Documents").join("Image-Line").join("FL Studio").join("Projects");
+    let mut newest: Option<(std::time::SystemTime, std::path::PathBuf)> = None;
+    let mut visit = |dir: &std::path::Path| {
+        if let Ok(rd) = std::fs::read_dir(dir) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.extension().and_then(|x| x.to_str()).map(|x| x.eq_ignore_ascii_case("wav")) == Some(true) {
+                    if let Ok(m) = e.metadata().and_then(|m| m.modified()) {
+                        if newest.as_ref().is_none_or(|(t, _)| m > *t) {
+                            newest = Some((m, p));
+                        }
+                    }
+                }
+            }
+        }
+    };
+    visit(&root);
+    if let Ok(rd) = std::fs::read_dir(&root) {
+        for e in rd.flatten() {
+            if e.path().is_dir() {
+                visit(&e.path());
+            }
+        }
+    }
+    let Some((_, path)) = newest else { return format!("No .wav found under {}", root.display()) };
+    match measure_wav(&path) {
+        Ok(s) => format!("{}\n{s}", path.display()),
+        Err(e) => format!("{}: {e}", path.display()),
+    }
+}
+
+/// Integrated loudness, loudest short-term, true and sample peak, and length of a WAV file.
+pub fn measure_wav(path: &std::path::Path) -> Result<String, Box<dyn std::error::Error>> {
+    let mut reader = hound::WavReader::open(path)?;
+    let spec = reader.spec();
+    let ch = spec.channels.max(1) as usize;
+    let mut m = LoudnessMeter::new(spec.sample_rate as f64);
+    let mut frame = Vec::with_capacity(ch);
+    let mut max_short = f64::NEG_INFINITY;
+    let mut n = 0usize;
+    let mut push = |v: f64, frame: &mut Vec<f64>, m: &mut LoudnessMeter| {
+        frame.push(v);
+        if frame.len() == ch {
+            let (l, r) = (frame[0], if ch > 1 { frame[1] } else { frame[0] });
+            m.process(l, r);
+            frame.clear();
+            n += 1;
+            if n % 4410 == 0 {
+                max_short = max_short.max(m.short_term);
+            }
+        }
+    };
+    match spec.sample_format {
+        hound::SampleFormat::Float => {
+            for s in reader.samples::<f32>() {
+                push(s? as f64, &mut frame, &mut m);
+            }
+        }
+        hound::SampleFormat::Int => {
+            let scale = 1.0 / (1u64 << (spec.bits_per_sample - 1)) as f64;
+            for s in reader.samples::<i32>() {
+                push(s? as f64 * scale, &mut frame, &mut m);
+            }
+        }
+    }
+    let db = |x: f64| if x > 0.0 { 20.0 * x.log10() } else { f64::NEG_INFINITY };
+    Ok(format!(
+        "{:.1} s  integrated {:.1} LUFS  max short-term {:.1} LUFS  true peak {:.2} dBTP  sample peak {:.2} dBFS",
+        n as f64 / spec.sample_rate as f64,
+        m.integrated(),
+        max_short,
+        db(m.true_peak_max),
+        db(m.sample_peak_max)
+    ))
+}
+
 fn cylinders_sorted() -> Vec<Arc<cylinder::CylShared>> {
     let mut c = cylinder::cylinders();
     c.sort_by_key(|c| c.id);
@@ -354,6 +450,10 @@ impl Default for Strata {
             out_meter: LoudnessMeter::new(44100.0),
             corr: [0.0; 3],
             corr_coef: 0.0,
+            st: [0.0, 0.0, 0.0, f64::INFINITY, f64::NEG_INFINITY],
+            inits: 0,
+            resets: 0,
+            fs: 44100.0,
         }
     }
 }
@@ -388,23 +488,39 @@ impl Plugin for Strata {
 
     fn initialize(&mut self, _layout: &AudioIOLayout, config: &BufferConfig, context: &mut impl InitContext<Self>) -> bool {
         let fs = config.sample_rate as f64;
+        self.fs = fs;
         self.chain = Chain::new(fs);
         self.in_meter = LoudnessMeter::new(fs);
         self.out_meter = LoudnessMeter::new(fs);
         self.corr_coef = (-1.0 / (0.3 * fs)).exp();
         context.set_latency_samples(self.chain.latency() as u32);
+        self.inits += 1;
         true
     }
 
     fn reset(&mut self) {
         self.corr = [0.0; 3];
+        self.resets += 1;
     }
 
-    fn process(&mut self, buffer: &mut Buffer, _aux: &mut AuxiliaryBuffers, _context: &mut impl ProcessContext<Self>) -> ProcessStatus {
+    fn process(&mut self, buffer: &mut Buffer, _aux: &mut AuxiliaryBuffers, context: &mut impl ProcessContext<Self>) -> ProcessStatus {
         if self.meters.reset.swap(false, Ordering::Relaxed) {
             cylinder::STATS_GEN.fetch_add(1, Ordering::Relaxed);
             self.in_meter.reset();
             self.out_meter.reset();
+            self.st = [0.0, 0.0, 0.0, f64::INFINITY, f64::NEG_INFINITY];
+            self.inits = 0;
+            self.resets = 0;
+        }
+        let t = context.transport();
+        let n = buffer.samples() as f64;
+        self.st[0] += n;
+        if t.playing {
+            self.st[1] += n;
+            if let Some(p) = t.pos_beats() {
+                self.st[3] = self.st[3].min(p);
+                self.st[4] = self.st[4].max(p);
+            }
         }
         cylinder::BALANCE_ON.store(self.params.balance_on.value(), Ordering::Relaxed);
         cylinder::STATIC_AMOUNT.store(self.params.balance_static.value(), Ordering::Relaxed);
@@ -416,6 +532,22 @@ impl Plugin for Strata {
 
         for (l, r) in left.iter().zip(right.iter()) {
             self.in_meter.process(*l as f64, *r as f64);
+            self.st[2] += 0.5 * (*l as f64 * *l as f64 + *r as f64 * *r as f64);
+        }
+        let fs = self.out_meter_fs();
+        let es = &self.meters.engine_stats;
+        let frames = self.st[0].max(1.0);
+        let vals = [
+            self.st[0] / fs,
+            100.0 * self.st[1] / frames,
+            if self.st[2] > 0.0 { 10.0 * (self.st[2] / frames).log10() } else { -200.0 },
+            if self.st[3].is_finite() { self.st[3] } else { -1.0 },
+            if self.st[4].is_finite() { self.st[4] } else { -1.0 },
+            self.inits as f64,
+            self.resets as f64,
+        ];
+        for (a, v) in es.iter().zip(vals) {
+            a.store(v as f32, Ordering::Relaxed);
         }
         let report = self.chain.process(left, right, &settings);
         let a = self.corr_coef;

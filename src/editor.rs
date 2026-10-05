@@ -202,6 +202,22 @@ fn meter_panel(ui: &mut egui::Ui, p: &StrataParams, m: &Meters, setter: &ParamSe
         if ui.button("Reset meters").clicked() {
             m.reset.store(true, Ordering::Relaxed);
         }
+        let es: Vec<f32> = m.engine_stats.iter().map(|a| a.load(Ordering::Relaxed)).collect();
+        ui.label(
+            RichText::new(format!(
+                "engine pass: {:.1} s  play {:.0}%  in {:.1} dB  pos {:.1}-{:.1}  inits {:.0}  resets {:.0}",
+                es[0], es[1], es[2], es[3], es[4], es[5], es[6]
+            ))
+            .monospace()
+            .size(11.0),
+        );
+        if ui.button("Measure latest export").on_hover_text("Newest .wav in the FL Studio Projects folder").clicked() {
+            *m.file_report.lock().unwrap() = crate::measure_latest_export();
+        }
+        let fr = m.file_report.lock().unwrap().clone();
+        if !fr.is_empty() {
+            ui.label(RichText::new(fr).monospace().size(11.0));
+        }
     });
 }
 

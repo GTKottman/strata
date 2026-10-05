@@ -141,3 +141,20 @@ fn width_zero_makes_mono_and_mono_bass_keeps_highs_wide() {
         assert!((l[i] - r[i]).abs() < 1e-4, "not mono at {i}");
     }
 }
+
+#[test]
+fn measure_wav_reads_ebu_reference_tone() {
+    let path = std::env::temp_dir().join(format!("strata-ref-{}.wav", std::process::id()));
+    let spec = hound::WavSpec { channels: 2, sample_rate: 48000, bits_per_sample: 24, sample_format: hound::SampleFormat::Int };
+    let mut w = hound::WavWriter::create(&path, spec).unwrap();
+    for v in sine(1000.0, db_to_gain(-23.0), 0.0, 10 * 48000) {
+        let s = (v as f64 * 8388607.0).round() as i32;
+        w.write_sample(s).unwrap();
+        w.write_sample(s).unwrap();
+    }
+    w.finalize().unwrap();
+    let report = crate::measure_wav(&path).unwrap();
+    let _ = std::fs::remove_file(&path);
+    assert!(report.contains("integrated -23.0 LUFS"), "{report}");
+    assert!(report.starts_with("10.0 s"), "{report}");
+}
