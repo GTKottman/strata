@@ -11,14 +11,22 @@ VST3 and CLAP, 64-bit Windows (built here by cross-compiling from Linux). Linux 
 
 | Layer | What it does | Controls |
 |---|---|---|
-| Tone | Mastering EQ | Low cut, Low shelf 110 Hz, Body 400 Hz, Presence 3 kHz, Air shelf 10 kHz (±6 dB) |
-| Glue | Stereo-linked bus compressor, 6 dB soft knee | Threshold, Ratio, Attack, Release, Makeup |
-| Warmth | Soft tanh saturation (unity gain for quiet signals) | Drive |
-| Width | Mid/side width with bass to mono | Width 0–200 %, Mono below |
-| Limiter (out) | Lookahead true-peak limiter, 1.5 ms lookahead | Input gain, Ceiling (dBTP), Release |
+| Tone | Mastering EQ; Presence and Air are matched to the analog curve up to Nyquist (no cramping) | Low cut, Low shelf 110 Hz, Body 400 Hz, Presence 3 kHz, Air shelf 10 kHz (±6 dB) |
+| Glue | Stereo-linked bus compressor, 6 dB soft knee, high-passed detector so kick and bass don't drive it | Threshold, Ratio, Attack, Release, Makeup, Sidechain HPF (100 Hz; 20 = off) |
+| Warmth | Soft tanh saturation, 4x oversampled (no aliasing), plus asymmetric grit on the bass band | Drive, Bass grit |
+| Width | Mid/side width with bass to mono (off by default) | Width 0–200 %, Mono below, Linear phase |
+| Limiter (out) | Lookahead true-peak limiter, 1.5 ms lookahead, program-dependent release, optional clipper before it | Input gain, Ceiling (dBTP), Release, Auto release, Clipper, Clip above ceiling |
 
 Use Up/Down on a layer to move it. Opacity changes and on/off are ramped, so they never click.
-Latency is reported to the host (1.5 ms + 12 samples).
+Latency is reported to the host: 1.5 ms + 140 samples (lookahead plus the two 4x oversamplers),
+plus 42.5 ms while Width's linear phase is on.
+
+- **Auto release**: a lone peak recovers at about half the release time, sustained limiting at about
+  three times it, so a dense loud passage doesn't pump.
+- **Clipper**: a 4x oversampled soft clipper before the limiter. Peaks are clipped to "Clip above
+  ceiling" dB over the ceiling and the limiter takes them the rest of the way. It is distortion: use
+  it on dirty genres, leave it off where the kick and sub must stay clean.
+- **Linear phase** (Width): bass to mono without shifting the side channel's phase.
 
 ## Engine + Cylinders (auto-balance)
 
@@ -48,7 +56,9 @@ want the Engine to own the balance.
 ## Meters
 
 Output: integrated, short-term and momentary loudness, true-peak max, correlation, Glue and limiter
-gain reduction. Input: integrated, short-term, true-peak max. Play the whole song, read the
+gain reduction, and the largest limiter reduction of the pass (a warning shows past 6 dB: get the
+loudness from Glue instead). **Compare 1:1** plays the input at the output's loudness, so switching
+it on and off judges the processing and not the level; the meters keep measuring the processed output. Input: integrated, short-term, true-peak max. Play the whole song, read the
 integrated loudness, then **Apply to limiter input gain** to reach the target. Reset meters before
 each full pass.
 

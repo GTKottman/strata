@@ -1,6 +1,7 @@
 //! Layers on the left (reorderable cards with on/off and opacity), meters on the right.
 
 use crate::dsp::{pack_order, unpack_order, LayerKind};
+use crate::genre::Genre;
 use crate::{Meters, StrataParams};
 use nih_plug::prelude::*;
 use nih_plug_egui::egui::{self, Color32, RichText};
@@ -34,6 +35,7 @@ pub fn create(params: Arc<StrataParams>, meters: Arc<Meters>) -> Option<Box<dyn 
                             layers(ui, &params, setter);
                         });
                         egui::ScrollArea::vertical().id_salt("right").show(&mut cols[1], |ui| {
+                            genre_panel(ui, &params, setter);
                             meter_panel(ui, &params, &meters, setter);
                             balance_panel(ui, &params, &meters, setter);
                         });
@@ -56,6 +58,15 @@ fn toggle(ui: &mut egui::Ui, param: &BoolParam, setter: &ParamSetter) {
 fn row(ui: &mut egui::Ui, label: &str, param: &FloatParam, setter: &ParamSetter) {
     ui.label(RichText::new(label).color(DIM));
     ui.add(ParamSlider::for_param(param, setter).with_width(190.0));
+    ui.end_row();
+}
+
+fn row_toggle(ui: &mut egui::Ui, label: &str, param: &BoolParam, setter: &ParamSetter, hint: &str) {
+    ui.label(RichText::new(label).color(DIM));
+    ui.horizontal(|ui| {
+        toggle(ui, param, setter);
+        ui.label(RichText::new(hint).color(DIM).size(11.0));
+    });
     ui.end_row();
 }
 
@@ -107,11 +118,16 @@ fn layers(ui: &mut egui::Ui, p: &StrataParams, setter: &ParamSetter) {
                         row(ui, "Attack", &p.glue_attack, setter);
                         row(ui, "Release", &p.glue_release, setter);
                         row(ui, "Makeup", &p.glue_makeup, setter);
+                        row(ui, "Sidechain HPF", &p.glue_sc_hpf, setter);
                     }
-                    LayerKind::Warmth => row(ui, "Drive", &p.warmth_drive, setter),
+                    LayerKind::Warmth => {
+                        row(ui, "Drive", &p.warmth_drive, setter);
+                        row(ui, "Bass grit", &p.warmth_grit, setter);
+                    }
                     LayerKind::Width => {
                         row(ui, "Width", &p.width_amount, setter);
                         row(ui, "Mono below", &p.width_mono_below, setter);
+                        row_toggle(ui, "Linear phase", &p.width_linear, setter, "no phase shift, adds ~43 ms latency");
                     }
                 }
             });
@@ -128,6 +144,9 @@ fn layers(ui: &mut egui::Ui, p: &StrataParams, setter: &ParamSetter) {
             row(ui, "Input gain", &p.limiter_gain, setter);
             row(ui, "Ceiling", &p.limiter_ceiling, setter);
             row(ui, "Release", &p.limiter_release, setter);
+            row_toggle(ui, "Auto release", &p.limiter_auto_release, setter, "fast after peaks, slow when dense");
+            row_toggle(ui, "Clipper", &p.clip_on, setter, "before the limiter; dirty genres only");
+            row(ui, "Clip above ceiling", &p.clip_db, setter);
         });
     });
 
@@ -135,6 +154,53 @@ fn layers(ui: &mut egui::Ui, p: &StrataParams, setter: &ParamSetter) {
         order.swap(a, b);
         p.layer_order.store(pack_order(order), Ordering::Relaxed);
     }
+}
+
+fn set_genre(p: &StrataParams, setter: &ParamSetter, g: Genre) {
+    setter.begin_set_parameter(&p.genre);
+    setter.set_parameter(&p.genre, g);
+    setter.end_set_parameter(&p.genre);
+}
+
+/// The genre the master leans towards, and what it is doing right now.
+fn genre_panel(ui: &mut egui::Ui, p: &StrataParams, setter: &ParamSetter) {
+    let g = p.genre.value();
+    card(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("GENRE").strong().color(ACCENT));
+            egui::ComboBox::from_id_salt("genre").selected_text(g.name()).width(150.0).show_ui(ui, |ui| {
+                for x in Genre::ALL {
+                    if ui.selectable_label(g == x, x.name()).clicked() {
+                        set_genre(p, setter, x);
+                    }
+                }
+            });
+            let i = g.index() as usize;
+            if ui.button("Prev").clicked() {
+                set_genre(p, setter, Genre::ALL[(i + Genre::ALL.len() - 1) % Genre::ALL.len()]);
+            }
+            if ui.button("Next").clicked() {
+                set_genre(p, setter, Genre::ALL[(i + 1) % Genre::ALL.len()]);
+            }
+        });
+        ui.label(RichText::new(g.character()).color(DIM));
+        if g != Genre::Neutral {
+            let s = p.settings();
+            let pr = g.preset();
+            ui.label(
+                RichText::new(format!(
+                    "ACTIVE  tone low {:+.1} body {:+.1} presence {:+.1} air {:+.1} dB, cut {:.0} Hz\n        glue {:.0} dB {:.1}:1 {:.0}/{:.0} ms   warmth {:.0} dB   bass grit {:.0} dB\n        width {:.0}% mono below {:.0} Hz   target {:.1} LUFS\n        roles: bass width {:.0}%, pads {:.0}%, drums {:.0}%",
+                    s.tone.low_db, s.tone.mid_db, s.tone.presence_db, s.tone.air_db, s.tone.low_cut_hz,
+                    s.glue.threshold_db, s.glue.ratio, s.glue.attack_ms, s.glue.release_ms, s.warmth.drive_db, s.warmth.grit_db,
+                    s.width.width * 100.0, s.width.mono_below_hz, pr.target_lufs,
+                    pr.role_width[1] * 100.0, pr.role_width[4] * 100.0, pr.role_width[0] * 100.0
+                ))
+                .monospace()
+                .size(11.0),
+            );
+            ui.label(RichText::new("Tone, Glue, Warmth and Width follow the genre; the Tone dB sliders, Bass grit and Width are trims on top.").color(DIM).size(11.0));
+        }
+    });
 }
 
 /// Readings below -70 (the BS.1770 absolute gate) show as -inf, so silence never prints -539.6.
@@ -166,6 +232,26 @@ fn meter_panel(ui: &mut egui::Ui, p: &StrataParams, m: &Meters, setter: &ParamSe
             big(ui, "Correlation", fmt(ld(&m.correlation), 2), "", Color32::WHITE);
             big(ui, "Glue GR", format!("{:5.1}", ld(&m.glue_gr)), "dB", Color32::WHITE);
             big(ui, "Limiter GR", format!("{:5.1}", ld(&m.limiter_gr)), "dB", Color32::WHITE);
+            big(ui, "Limiter GR max", format!("{:5.1}", ld(&m.limiter_gr_max)), "dB", Color32::WHITE);
+        });
+        let gr_max = ld(&m.limiter_gr_max);
+        if gr_max > 6.0 {
+            ui.label(
+                RichText::new(format!(
+                    "Limiter took {gr_max:.1} dB on the loudest peaks. Past about 6 dB limiting starts to sound bad: \
+                     lower the input gain and get the loudness from Glue, or try the clipper on a dirty song."
+                ))
+                .color(Color32::from_rgb(235, 90, 80)),
+            );
+        }
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            toggle(ui, &p.compare, setter);
+            ui.label(RichText::new("Compare 1:1").strong());
+            ui.label(
+                RichText::new(format!("hear the input at the output's loudness ({:+.1} dB)", ld(&m.compare_db)))
+                    .color(DIM),
+            );
         });
     });
 
@@ -180,10 +266,14 @@ fn meter_panel(ui: &mut egui::Ui, p: &StrataParams, m: &Meters, setter: &ParamSe
 
     card(ui, |ui| {
         ui.label(RichText::new("TARGET").strong().color(ACCENT));
-        egui::Grid::new("target").num_columns(2).spacing([10.0, 4.0]).show(ui, |ui| {
-            row(ui, "Target", &p.target_lufs, setter);
-        });
-        let target = p.target_lufs.value();
+        if p.genre.value() == Genre::Neutral {
+            egui::Grid::new("target").num_columns(2).spacing([10.0, 4.0]).show(ui, |ui| {
+                row(ui, "Target", &p.target_lufs, setter);
+            });
+        } else {
+            ui.label(RichText::new(format!("Target {:.1} LUFS ({})", p.target(), p.genre.value().name())).monospace());
+        }
+        let target = p.target() as f32;
         if out_i.is_finite() && out_i > -70.0 {
             let delta = target - out_i;
             ui.label(RichText::new(format!("Gain to target: {delta:+.1} dB")).monospace().size(18.0));
@@ -259,6 +349,7 @@ fn balance_panel(ui: &mut egui::Ui, p: &StrataParams, m: &Meters, setter: &Param
         egui::Grid::new("bal").num_columns(2).spacing([10.0, 4.0]).show(ui, |ui| {
             row(ui, "Static balance", &p.balance_static, setter);
             row(ui, "Moments", &p.balance_moments, setter);
+            row(ui, "Width plan", &p.balance_width, setter);
         });
         ui.add_space(4.0);
         ui.label(RichText::new(format!("{} cylinders", cyls.len())).color(DIM));
@@ -269,11 +360,12 @@ fn balance_panel(ui: &mut egui::Ui, p: &StrataParams, m: &Meters, setter: &Param
             let name = if label.is_empty() { format!("#{}", c.id) } else { format!("#{} {}", c.id, label) };
             ui.label(
                 RichText::new(format!(
-                    "{:<18} {:<8} learned {:>4}  gain {:+5.1} dB",
+                    "{:<18} {:<8} learned {:>4}  gain {:+5.1} dB  width {:>3.0}%",
                     name,
                     crate::orchestra::Role::from_index(c.role.load(Ordering::Relaxed)).name(),
                     c.learned_beats.load(Ordering::Relaxed),
-                    c.live_gain_db.load(Ordering::Relaxed)
+                    c.live_gain_db.load(Ordering::Relaxed),
+                    c.width.load(Ordering::Relaxed) * 100.0
                 ))
                 .monospace(),
             );

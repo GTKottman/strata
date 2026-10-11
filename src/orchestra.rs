@@ -11,7 +11,13 @@
 //!   Only one sustained melodic part and nothing moving: it is the feature, +1.5.
 //! - Drums and bass keep their static level (no moments), so the groove never pumps.
 //! - Curves are smoothed over 3 beats and clamped to +-6.
+//! - Width, per channel and static for the song: the genre's width for the role (bass mono, pads
+//!   wide...), capped so an already-wide channel never ends with its side louder than -2.2 dB under
+//!   its middle. A channel with (almost) no side signal can't be widened; the report says so.
+//!
+//! The role levels and widths come from a genre preset (`genre.rs`); `plan` uses Neutral.
 
+use crate::genre::{Genre, Preset};
 use nih_plug::prelude::Enum;
 use serde::Serialize;
 
@@ -49,18 +55,6 @@ impl Role {
         }
     }
 
-    fn template_db(self) -> f64 {
-        match self {
-            Role::Drums => 0.0,
-            Role::Bass => -2.0,
-            Role::Lead => -1.0,
-            Role::Keys => -5.0,
-            Role::Pad => -9.0,
-            Role::Texture => -15.0,
-            Role::Auto => -5.0,
-        }
-    }
-
     fn melodic(self) -> bool {
         matches!(self, Role::Lead | Role::Keys | Role::Pad)
     }
@@ -86,6 +80,8 @@ pub struct TrackInput {
     pub low: Vec<f32>,
     pub mid: Vec<f32>,
     pub high: Vec<f32>,
+    /// Mean square of the side signal ((L - R) / 2) per beat; `energy` is the middle ((L + R) / 2).
+    pub side: Vec<f32>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -97,6 +93,14 @@ pub struct TrackResult {
     pub active_beats: usize,
     pub loudness_db: f64,
     pub static_db: f64,
+    /// Side-to-middle energy ratio the channel arrived with (0 = mono).
+    pub side_ratio: f64,
+    /// Side gain the plan sets (0 = mono, 1 = as it is, 2 = double).
+    pub width: f64,
+    /// Below this the channel's side signal is removed.
+    pub mono_below_hz: f64,
+    /// Why the width is what it is, when it is not simply the genre's width for the role.
+    pub width_note: String,
     #[serde(skip)]
     pub curve_db: Vec<f32>,
 }
@@ -111,6 +115,7 @@ pub struct Moment {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Plan {
+    pub genre: Genre,
     pub beats: usize,
     pub beats_per_bar: usize,
     pub tracks: Vec<TrackResult>,
@@ -118,6 +123,10 @@ pub struct Plan {
 }
 
 const ACTIVE_RANGE_DB: f64 = 35.0;
+/// Widening stops when the side would reach this fraction of the middle's energy (-2.2 dB).
+const MAX_SIDE_RATIO: f64 = 0.6;
+/// Below this side-to-middle ratio a channel counts as mono (side 30 dB under the middle).
+const MONO_SIDE_RATIO: f64 = 0.001;
 const MOVING_ONSETS: f32 = 0.5;
 
 fn db(x: f64) -> f64 {
@@ -160,7 +169,28 @@ pub fn guess_role(t: &TrackInput, active: &[bool]) -> Role {
     }
 }
 
+/// Width for one channel: the genre's width for its role, capped for already-wide channels.
+pub fn plan_width(preset: &Preset, role: Role, side_ratio: f64) -> (f64, f64, String) {
+    let want = preset.role_width(role).clamp(0.0, 2.0);
+    let mono_hz = preset.role_mono_below_hz(role);
+    if want > 1.0 && side_ratio < MONO_SIDE_RATIO {
+        return (want, mono_hz, "mono source: widening has no effect (pan it or add a stereo effect)".into());
+    }
+    if want > 1.0 && side_ratio * want * want > MAX_SIDE_RATIO {
+        let capped = (MAX_SIDE_RATIO / side_ratio).sqrt().max(1.0);
+        if capped < want {
+            return (capped, mono_hz, format!("already wide: capped at {:.0}% (genre wants {:.0}%)", capped * 100.0, want * 100.0));
+        }
+    }
+    (want, mono_hz, String::new())
+}
+
 pub fn plan(tracks: &[TrackInput], beats_per_bar: usize) -> Plan {
+    plan_for(tracks, beats_per_bar, Genre::Neutral)
+}
+
+pub fn plan_for(tracks: &[TrackInput], beats_per_bar: usize, genre: Genre) -> Plan {
+    let preset = genre.preset();
     let beats = tracks.iter().map(|t| t.energy.len()).max().unwrap_or(0);
     let bpb = beats_per_bar.max(1);
     let padded: Vec<TrackInput> = tracks
@@ -171,7 +201,7 @@ pub fn plan(tracks: &[TrackInput], beats_per_bar: usize) -> Plan {
                 v.resize(beats, 0.0);
                 v
             };
-            TrackInput { energy: pad(&t.energy), onsets: pad(&t.onsets), low: pad(&t.low), mid: pad(&t.mid), high: pad(&t.high), ..t.clone() }
+            TrackInput { energy: pad(&t.energy), onsets: pad(&t.onsets), low: pad(&t.low), mid: pad(&t.mid), high: pad(&t.high), side: pad(&t.side), ..t.clone() }
         })
         .collect();
 
@@ -194,7 +224,7 @@ pub fn plan(tracks: &[TrackInput], beats_per_bar: usize) -> Plan {
             (n > 0).then(|| db(sum / n as f64))
         })
         .collect();
-    let mut offsets: Vec<f64> = loud.iter().zip(&roles).filter_map(|(l, (r, _))| l.map(|l| l - r.template_db())).collect();
+    let mut offsets: Vec<f64> = loud.iter().zip(&roles).filter_map(|(l, (r, _))| l.map(|l| l - preset.role_db(*r))).collect();
     offsets.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let reference = if offsets.is_empty() { 0.0 } else { offsets[offsets.len() / 2] };
 
@@ -244,7 +274,10 @@ pub fn plan(tracks: &[TrackInput], beats_per_bar: usize) -> Plan {
                     avg.clamp(-6.0, 6.0)
                 })
                 .collect();
-            let static_db = loud[i].map(|l| (reference + roles[i].0.template_db() - l).clamp(-9.0, 9.0)).unwrap_or(0.0);
+            let static_db = loud[i].map(|l| (reference + preset.role_db(roles[i].0) - l).clamp(-9.0, 9.0)).unwrap_or(0.0);
+            let (mid_sum, side_sum) = t.energy.iter().zip(&t.side).zip(&actives[i]).filter(|(_, on)| **on).fold((0.0f64, 0.0f64), |(m, s), ((e, sd), _)| (m + *e as f64, s + *sd as f64));
+            let side_ratio = if mid_sum > 0.0 { side_sum / mid_sum } else { 0.0 };
+            let (width, mono_below_hz, width_note) = plan_width(&preset, roles[i].0, side_ratio);
             TrackResult {
                 id: t.id,
                 label: t.label.clone(),
@@ -253,6 +286,10 @@ pub fn plan(tracks: &[TrackInput], beats_per_bar: usize) -> Plan {
                 active_beats: actives[i].iter().filter(|a| **a).count(),
                 loudness_db: loud[i].unwrap_or(f64::NEG_INFINITY),
                 static_db,
+                side_ratio,
+                width,
+                mono_below_hz,
+                width_note,
                 curve_db: curve,
             }
         })
@@ -274,7 +311,7 @@ pub fn plan(tracks: &[TrackInput], beats_per_bar: usize) -> Plan {
     }
     moments.retain(|m| !m.featured.is_empty() || !m.sitting_back.is_empty());
 
-    Plan { beats, beats_per_bar: bpb, tracks: results, moments }
+    Plan { genre, beats, beats_per_bar: bpb, tracks: results, moments }
 }
 
 #[cfg(test)]
@@ -290,6 +327,7 @@ mod tests {
             low: energy.iter().map(|e| e * 0.2).collect(),
             mid: energy.iter().map(|e| e * 0.6).collect(),
             high: energy.iter().map(|e| e * 0.2).collect(),
+            side: energy.iter().map(|e| e * 0.1).collect(),
             energy,
             onsets: { let mut o = onsets; o.resize(n, 0.0); o },
         }
@@ -343,6 +381,33 @@ mod tests {
         let s = |i: usize| p.tracks[i].static_db;
         assert!(((s(0) - s(2)) - 9.0).abs() < 0.01, "{} {}", s(0), s(2));
         assert!(((s(0) - s(1)) - 2.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn trip_hop_plan_sets_mono_bass_wide_pad_and_its_own_levels() {
+        let drums = track(1, Role::Drums, vec![0.1; 6], vec![3.0; 6]);
+        let bass = track(2, Role::Bass, vec![0.1; 6], vec![1.0; 6]);
+        let pad = track(3, Role::Pad, vec![0.1; 6], vec![0.0; 6]);
+        let p = plan_for(&[drums, bass, pad], 3, Genre::TripHop);
+        assert_eq!(p.tracks[1].width, 0.0, "bass mono");
+        assert!(p.tracks[2].width > 1.3, "pad wide: {}", p.tracks[2].width);
+        assert!(p.tracks[0].width < 1.0, "drums narrower");
+        // Trip hop bass sits 1 dB under the drums (Neutral: 2).
+        assert!(((p.tracks[0].static_db - p.tracks[1].static_db) - 1.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn width_is_capped_for_wide_sources_and_flagged_for_mono_ones() {
+        let preset = Genre::TripHop.preset();
+        let (w, _, note) = plan_width(&preset, Role::Pad, 0.5);
+        assert!(w < 1.5 && w >= 1.0 && note.contains("already wide"), "{w} {note}");
+        assert!(0.5 * w * w <= MAX_SIDE_RATIO + 1e-9);
+        let (w, _, note) = plan_width(&preset, Role::Pad, 0.0);
+        assert_eq!(w, 1.5);
+        assert!(note.contains("mono source"));
+        let (w, hz, note) = plan_width(&preset, Role::Bass, 0.3);
+        assert_eq!((w, note.as_str()), (0.0, ""));
+        assert!(hz >= 200.0);
     }
 
     #[test]

@@ -5,6 +5,7 @@
 //! Cylinders and the Engine live in the same DLL, so in the host's process they find each other
 //! through the static registry below (FL loads plugins in-process unless a plugin is bridged).
 
+use crate::dsp::filter::{Biquad, Coefs};
 use crate::orchestra::Role;
 use nih_plug::prelude::*;
 use nih_plug_egui::egui::{self, Color32, RichText};
@@ -24,6 +25,10 @@ pub static LEARNING: AtomicBool = AtomicBool::new(false);
 pub static STATIC_AMOUNT: AtomicF32 = AtomicF32::new(1.0);
 pub static MOMENT_AMOUNT: AtomicF32 = AtomicF32::new(1.0);
 pub static BALANCE_ON: AtomicBool = AtomicBool::new(true);
+/// Engine-controlled amount (0..1) of the per-channel width plan.
+pub static WIDTH_AMOUNT: AtomicF32 = AtomicF32::new(1.0);
+/// The Engine's genre (index into `Genre::ALL`), used when it plans.
+pub static GENRE: AtomicU32 = AtomicU32::new(0);
 /// Beats per bar as last seen by any instance (for the report).
 pub static BEATS_PER_BAR: AtomicU32 = AtomicU32::new(4);
 
@@ -40,11 +45,27 @@ pub fn cylinders() -> Vec<Arc<CylShared>> {
 }
 
 /// What a Cylinder keeps in the project.
-#[derive(Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct CylState {
     pub label: String,
     pub static_db: f32,
     pub curve: Vec<f32>,
+    /// Planned side gain (1 = as it is). Older projects have none: as it is.
+    #[serde(default = "one")]
+    pub width: f32,
+    /// Planned "side to mono below" frequency, Hz (0 = off).
+    #[serde(default)]
+    pub mono_below_hz: f32,
+}
+
+fn one() -> f32 {
+    1.0
+}
+
+impl Default for CylState {
+    fn default() -> Self {
+        Self { label: String::new(), static_db: 0.0, curve: Vec::new(), width: 1.0, mono_below_hz: 0.0 }
+    }
 }
 
 pub struct CylShared {
@@ -54,10 +75,13 @@ pub struct CylShared {
     pub low: Vec<AtomicF32>,
     pub mid: Vec<AtomicF32>,
     pub high: Vec<AtomicF32>,
+    pub side: Vec<AtomicF32>,
     pub learned_beats: AtomicU32,
     pub curve: Vec<AtomicF32>,
     pub curve_len: AtomicU32,
     pub static_db: AtomicF32,
+    pub width: AtomicF32,
+    pub mono_below_hz: AtomicF32,
     pub live_gain_db: AtomicF32,
     /// Statistics since the last meter reset (diagnostics).
     pub stats: [AtomicF32; STAT_COUNT],
@@ -75,10 +99,13 @@ impl CylShared {
             low: arr(),
             mid: arr(),
             high: arr(),
+            side: arr(),
             learned_beats: AtomicU32::new(0),
             curve: arr(),
             curve_len: AtomicU32::new(0),
             static_db: AtomicF32::new(0.0),
+            width: AtomicF32::new(1.0),
+            mono_below_hz: AtomicF32::new(0.0),
             live_gain_db: AtomicF32::new(0.0),
             stats: std::array::from_fn(|_| AtomicF32::new(0.0)),
             role: AtomicU32::new(0),
@@ -91,30 +118,34 @@ impl CylShared {
     }
 
     /// Install a plan result (called by the Engine, off the audio thread).
-    pub fn set_plan(&self, static_db: f32, curve: &[f32]) {
+    pub fn set_plan(&self, static_db: f32, curve: &[f32], width: f32, mono_below_hz: f32) {
         let n = curve.len().min(MAX_BEATS);
         for (slot, v) in self.curve.iter().zip(&curve[..n]) {
             slot.store(*v, Ordering::Relaxed);
         }
         self.curve_len.store(n as u32, Ordering::Relaxed);
         self.static_db.store(static_db, Ordering::Relaxed);
+        self.width.store(width, Ordering::Relaxed);
+        self.mono_below_hz.store(mono_below_hz, Ordering::Relaxed);
         if let Ok(mut s) = self.state.lock() {
             s.static_db = static_db;
             s.curve = curve[..n].to_vec();
+            s.width = width;
+            s.mono_below_hz = mono_below_hz;
         }
     }
 
     pub fn clear_plan(&self) {
-        self.set_plan(0.0, &[]);
+        self.set_plan(0.0, &[], 1.0, 0.0);
     }
 
     fn load_state(&self) {
         let s = self.state.lock().map(|s| s.clone()).unwrap_or_default();
-        self.set_plan(s.static_db, &s.curve);
+        self.set_plan(s.static_db, &s.curve, s.width, s.mono_below_hz);
     }
 
     fn clear_learning(&self) {
-        for v in [&self.energy, &self.onsets, &self.low, &self.mid, &self.high] {
+        for v in [&self.energy, &self.onsets, &self.low, &self.mid, &self.high, &self.side] {
             v.iter().for_each(|a| a.store(0.0, Ordering::Relaxed));
         }
         self.learned_beats.store(0, Ordering::Relaxed);
@@ -175,6 +206,7 @@ pub struct Features {
     hold: usize,
     hold_len: usize,
     pub acc: [f64; 4], // energy, low, mid, high
+    pub side_acc: f64,
     pub onsets: u32,
     pub count: u32,
 }
@@ -195,9 +227,16 @@ impl Features {
             hold: 0,
             hold_len: (0.06 * fs) as usize,
             acc: [0.0; 4],
+            side_acc: 0.0,
             onsets: 0,
             count: 0,
         }
+    }
+
+    /// The side signal ((L - R) / 2) of the sample just pushed.
+    #[inline]
+    pub fn push_side(&mut self, s: f64) {
+        self.side_acc += s * s;
     }
 
     #[inline]
@@ -230,7 +269,8 @@ impl Features {
         false
     }
 
-    pub fn take(&mut self) -> Option<[f32; 5]> {
+    /// Energy, onsets, low, mid, high, side for the beat that just ended.
+    pub fn take(&mut self) -> Option<[f32; 6]> {
         if self.count == 0 {
             return None;
         }
@@ -241,11 +281,43 @@ impl Features {
             (self.acc[1] / n) as f32,
             (self.acc[2] / n) as f32,
             (self.acc[3] / n) as f32,
+            (self.side_acc / n) as f32,
         ];
         self.acc = [0.0; 4];
+        self.side_acc = 0.0;
         self.onsets = 0;
         self.count = 0;
         Some(out)
+    }
+}
+
+// ---- width ----
+
+/// Mid/side width with the side high-passed below a frequency (bass to mono). Pure, so it is tested.
+pub struct WidthStage {
+    fs: f64,
+    hp: Biquad,
+    hz: f64,
+    w: f64,
+    w_a: f64,
+}
+
+impl WidthStage {
+    pub fn new(fs: f64) -> Self {
+        Self { fs, hp: Biquad::new(Coefs::identity()), hz: 0.0, w: 1.0, w_a: 1.0 - (-1.0 / (0.05 * fs)).exp() }
+    }
+
+    /// `width` 0 = mono, 1 = as it is, 2 = double side; `mono_below_hz` <= 20 = off.
+    #[inline]
+    pub fn process(&mut self, l: f64, r: f64, width: f64, mono_below_hz: f64) -> (f64, f64) {
+        if (mono_below_hz - self.hz).abs() > 0.5 {
+            self.hz = mono_below_hz;
+            self.hp.c = if mono_below_hz <= 20.0 { Coefs::identity() } else { Coefs::highpass(self.fs, mono_below_hz, 0.707) };
+        }
+        self.w += (width - self.w) * self.w_a;
+        let m = 0.5 * (l + r);
+        let s = self.hp.process(0.5 * (l - r)) * self.w;
+        (m + s, m - s)
     }
 }
 
@@ -291,6 +363,7 @@ pub struct StrataCylinder {
     cur_beat: i64,
     gain_db: f64,
     gain_a: f64,
+    width: WidthStage,
 }
 
 impl Default for StrataCylinder {
@@ -309,6 +382,7 @@ impl Default for StrataCylinder {
             gain_a: 0.0,
             seen_stats: u32::MAX,
             stats: PassStats::default(),
+            width: WidthStage::new(44100.0),
         }
     }
 }
@@ -384,6 +458,8 @@ impl Plugin for StrataCylinder {
                     let planned = shared.curve_len.load(Ordering::Relaxed);
                     ui.label(RichText::new(format!("Learned beats: {learned}")).monospace());
                     ui.label(RichText::new(format!("Plan: {} beats, static {:+.1} dB", planned, shared.static_db.load(Ordering::Relaxed))).monospace());
+                    let (w, hz) = (shared.width.load(Ordering::Relaxed), shared.mono_below_hz.load(Ordering::Relaxed));
+                    ui.label(RichText::new(format!("Width: {:.0}%{}", w * 100.0, if hz > 20.0 { format!(", mono below {hz:.0} Hz") } else { String::new() })).monospace());
                     ui.label(RichText::new(format!("Gain now: {:+.1} dB", shared.live_gain_db.load(Ordering::Relaxed))).monospace().size(18.0));
                 });
                 ctx.request_repaint();
@@ -395,6 +471,7 @@ impl Plugin for StrataCylinder {
         self.fs = config.sample_rate as f64;
         self.features = Features::new(self.fs);
         self.gain_a = 1.0 - (-1.0 / (0.06 * self.fs)).exp();
+        self.width = WidthStage::new(self.fs);
         self.shared.load_state();
         true
     }
@@ -435,6 +512,14 @@ impl Plugin for StrataCylinder {
         let mo_amt = MOMENT_AMOUNT.load(Ordering::Relaxed) as f64;
         let curve_len = sh.curve_len.load(Ordering::Relaxed) as i64;
         let static_db = sh.static_db.load(Ordering::Relaxed) as f64;
+        // Width follows the plan like the gain does; with no plan (or not following) the channel is untouched.
+        let planned = follow && (curve_len > 0 || static_db != 0.0);
+        let w_amt = WIDTH_AMOUNT.load(Ordering::Relaxed) as f64;
+        let (width, mono_hz) = if planned {
+            (1.0 + (sh.width.load(Ordering::Relaxed) as f64 - 1.0) * w_amt, if w_amt > 0.0 { sh.mono_below_hz.load(Ordering::Relaxed) as f64 } else { 0.0 })
+        } else {
+            (1.0, 0.0)
+        };
 
         if pos.is_none() && self.cur_beat >= 0 {
             self.cur_beat = -1;
@@ -445,6 +530,7 @@ impl Plugin for StrataCylinder {
             let trim = self.params.trim.smoothed.next() as f64;
             let (l, r) = unsafe { (*frame.get_unchecked_mut(0) as f64, *frame.get_unchecked_mut(1) as f64) };
             self.features.push(0.5 * (l + r));
+            self.features.push_side(0.5 * (l - r));
 
             let mut target = trim;
             if let Some(p0) = pos {
@@ -454,7 +540,7 @@ impl Plugin for StrataCylinder {
                     if let Some(f) = self.features.take() {
                         if learning && self.cur_beat >= 0 && (self.cur_beat as usize) < MAX_BEATS {
                             let b = self.cur_beat as usize;
-                            for (arr, v) in [&sh.energy, &sh.onsets, &sh.low, &sh.mid, &sh.high].into_iter().zip(f) {
+                            for (arr, v) in [&sh.energy, &sh.onsets, &sh.low, &sh.mid, &sh.high, &sh.side].into_iter().zip(f) {
                                 arr[b].store(v, Ordering::Relaxed);
                             }
                             sh.learned_beats.fetch_max(b as u32 + 1, Ordering::Relaxed);
@@ -473,15 +559,17 @@ impl Plugin for StrataCylinder {
             }
 
             self.gain_db += (target - self.gain_db) * self.gain_a;
-            let g = 10f64.powf(self.gain_db / 20.0) as f32;
-            for s in frame.iter_mut() {
-                *s *= g;
+            let g = 10f64.powf(self.gain_db / 20.0);
+            let (wl, wr) = if planned || self.width.w != 1.0 { self.width.process(l, r, width, mono_hz) } else { (l, r) };
+            unsafe {
+                *frame.get_unchecked_mut(0) = (wl * g) as f32;
+                *frame.get_unchecked_mut(1) = (wr * g) as f32;
             }
 
             let st = &mut self.stats;
             st.frames += 1.0;
             st.in_sq += 0.5 * (l * l + r * r);
-            st.out_sq += 0.5 * (l * l + r * r) * (g as f64) * (g as f64);
+            st.out_sq += 0.5 * (wl * wl + wr * wr) * g * g;
             st.gain_db += self.gain_db;
             if let Some(p0) = pos {
                 let p = p0 + i as f64 * beats_per_sample;
@@ -534,6 +622,31 @@ mod tests {
     }
 
     #[test]
+    fn width_stage_mono_wide_and_bass_to_mono() {
+        let fs = 48000.0;
+        let side_energy = |width: f64, hz: f64, freq: f64| {
+            let mut w = WidthStage::new(fs);
+            let (mut se, mut me) = (0.0, 0.0);
+            for i in 0..48000 {
+                let t = i as f64 / fs;
+                // Left and right differ: a source panned left with some stereo spread.
+                let x = (2.0 * std::f64::consts::PI * freq * t).sin();
+                let (l, r) = w.process(0.8 * x, 0.3 * x, width, hz);
+                if i > 24000 {
+                    se += (0.5 * (l - r)).powi(2);
+                    me += (0.5 * (l + r)).powi(2);
+                }
+            }
+            se / me
+        };
+        let base = side_energy(1.0, 0.0, 1000.0);
+        assert!((side_energy(0.0, 0.0, 1000.0)) < 1e-6, "mono");
+        assert!((side_energy(1.5, 0.0, 1000.0) / base - 2.25).abs() < 0.05, "1.5x side = 2.25x energy");
+        assert!(side_energy(1.0, 200.0, 60.0) < 0.1 * side_energy(1.0, 0.0, 60.0), "60 Hz side removed below 200 Hz");
+        assert!(side_energy(1.0, 200.0, 2000.0) > 0.9 * side_energy(1.0, 0.0, 2000.0), "highs keep their width");
+    }
+
+    #[test]
     fn engine_balances_registered_cylinders_and_writes_report() {
         let dir = std::env::temp_dir().join(format!("strata-test-{}", std::process::id()));
         std::env::set_var("USERPROFILE", &dir);
@@ -553,6 +666,7 @@ mod tests {
         }
         a.shared.role.store(Role::Lead.index(), Ordering::Relaxed);
         b.shared.role.store(Role::Pad.index(), Ordering::Relaxed);
+        a.shared.side[0].store(0.01, Ordering::Relaxed);
         let summary = crate::balance_now();
         assert!(summary.contains("report:"), "{summary}");
         assert_eq!(a.shared.curve_len.load(Ordering::Relaxed), 6);
@@ -560,7 +674,7 @@ mod tests {
         assert!(b.shared.curve[2].load(Ordering::Relaxed) < -1.0);
         assert_eq!(a.shared.state.lock().unwrap().curve.len(), 6, "plan saved with the project");
         let report = std::fs::read_to_string(dir.join("Documents/Strata/report.json")).unwrap();
-        assert!(report.contains("curve_db_per_bar") && report.contains("moments"));
+        assert!(report.contains("curve_db_per_bar") && report.contains("moments") && report.contains("\"width\""));
         let _ = std::fs::remove_dir_all(dir);
     }
 }

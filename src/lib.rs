@@ -3,10 +3,12 @@
 pub mod cylinder;
 pub mod dsp;
 mod editor;
+pub mod genre;
 pub mod orchestra;
 
 use dsp::meter::LoudnessMeter;
 use dsp::{pack_order, unpack_order, Chain, Settings, DEFAULT_ORDER};
+use genre::Genre;
 use nih_plug::prelude::*;
 use nih_plug_egui::EguiState;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -24,6 +26,10 @@ pub struct Meters {
     pub correlation: AtomicF32,
     pub glue_gr: AtomicF32,
     pub limiter_gr: AtomicF32,
+    /// Largest limiter gain reduction since the last meter reset (dB).
+    pub limiter_gr_max: AtomicF32,
+    /// Gain the 1:1 compare puts on the input (output minus input loudness, dB).
+    pub compare_db: AtomicF32,
     pub reset: AtomicBool,
     /// Engine pass statistics since the last meter reset: seconds, playing %, input mean-square dB,
     /// first and last song position (beats), initialize() calls, reset() calls.
@@ -62,6 +68,8 @@ impl Default for Meters {
             correlation: AtomicF32::new(0.0),
             glue_gr: AtomicF32::new(0.0),
             limiter_gr: AtomicF32::new(0.0),
+            limiter_gr_max: AtomicF32::new(0.0),
+            compare_db: AtomicF32::new(0.0),
             reset: AtomicBool::new(false),
             engine_stats: std::array::from_fn(|_| AtomicF32::new(0.0)),
             file_report: Mutex::new(String::new()),
@@ -90,6 +98,16 @@ pub struct Strata {
     was_playing: bool,
     next_snapshot: f64,
     last_block: usize,
+    /// Latency last reported to the host (it changes with the linear-phase Width).
+    reported_latency: usize,
+    /// 1:1 compare: copy of the input block, its delay line (sized for the largest latency) and
+    /// the smoothed match gain.
+    dry: [Vec<f32>; 2],
+    dry_ring: [Vec<f32>; 2],
+    dry_pos: usize,
+    compare_gain: f64,
+    compare_coef: f64,
+    limiter_gr_max: f64,
 }
 
 impl Strata {
@@ -161,6 +179,9 @@ pub struct StrataParams {
     pub glue_release: FloatParam,
     #[id = "glue_makeup"]
     pub glue_makeup: FloatParam,
+    /// High-pass on the Glue detector only, so kick and bass don't drive the compressor.
+    #[id = "glue_schpf"]
+    pub glue_sc_hpf: FloatParam,
 
     #[id = "warm_on"]
     pub warmth_on: BoolParam,
@@ -168,6 +189,9 @@ pub struct StrataParams {
     pub warmth_opacity: FloatParam,
     #[id = "warm_drive"]
     pub warmth_drive: FloatParam,
+    /// Saturation of the low band only; in a genre it is added to the genre's own grit.
+    #[id = "warm_grit"]
+    pub warmth_grit: FloatParam,
 
     #[id = "width_on"]
     pub width_on: BoolParam,
@@ -177,6 +201,9 @@ pub struct StrataParams {
     pub width_amount: FloatParam,
     #[id = "width_mono"]
     pub width_mono_below: FloatParam,
+    /// Bass to mono without phase shift (adds latency).
+    #[id = "width_linear"]
+    pub width_linear: BoolParam,
 
     #[id = "lim_on"]
     pub limiter_on: BoolParam,
@@ -186,6 +213,16 @@ pub struct StrataParams {
     pub limiter_ceiling: FloatParam,
     #[id = "lim_release"]
     pub limiter_release: FloatParam,
+    #[id = "lim_auto_rel"]
+    pub limiter_auto_release: BoolParam,
+    #[id = "lim_clip_on"]
+    pub clip_on: BoolParam,
+    #[id = "lim_clip_db"]
+    pub clip_db: FloatParam,
+
+    /// 1:1 compare: hear the input at the output's loudness (meters keep measuring the processed output).
+    #[id = "compare"]
+    pub compare: BoolParam,
 
     /// Engine: follow the balance plan in every Cylinder.
     #[id = "bal_on"]
@@ -196,6 +233,13 @@ pub struct StrataParams {
     /// Engine: how much of the moment-by-moment balance to apply.
     #[id = "bal_moments"]
     pub balance_moments: FloatParam,
+    /// Engine: how much of the per-channel width plan to apply (0 = every channel as it is).
+    #[id = "bal_width"]
+    pub balance_width: FloatParam,
+
+    /// The genre the master chain and the balance plan lean towards. Neutral = the layers by hand.
+    #[id = "genre"]
+    pub genre: EnumParam<Genre>,
 
     /// Loudness target used by the editor's "gain to target" readout.
     #[id = "target"]
@@ -226,10 +270,12 @@ impl Default for StrataParams {
             glue_attack: ms_param("Attack", d.glue.attack_ms as f32, 0.1, 100.0),
             glue_release: ms_param("Release", d.glue.release_ms as f32, 20.0, 1000.0),
             glue_makeup: db_param("Makeup", 0.0, 0.0, 12.0),
+            glue_sc_hpf: freq_param("Glue Sidechain HPF", d.glue.sc_hpf_hz as f32, 20.0, 300.0),
 
             warmth_on: BoolParam::new("Warmth On", d.warmth.on),
             warmth_opacity: opacity_param("Warmth Opacity", d.warmth.opacity as f32),
             warmth_drive: db_param("Drive", d.warmth.drive_db as f32, 0.0, 24.0),
+            warmth_grit: db_param("Bass Grit", 0.0, 0.0, 24.0),
 
             width_on: BoolParam::new("Width On", d.width.on),
             width_opacity: opacity_param("Width Opacity", d.width.opacity as f32),
@@ -238,15 +284,22 @@ impl Default for StrataParams {
                 .with_value_to_string(formatters::v2s_f32_percentage(0))
                 .with_string_to_value(formatters::s2v_f32_percentage()),
             width_mono_below: freq_param("Mono Below", d.width.mono_below_hz as f32, 20.0, 300.0),
+            width_linear: BoolParam::new("Linear Phase Mono", d.width.linear_phase),
 
             limiter_on: BoolParam::new("Limiter On", d.limiter.on),
             limiter_gain: db_param("Input Gain", 0.0, 0.0, 24.0),
             limiter_ceiling: db_param("Ceiling (dBTP)", d.limiter.ceiling_db as f32, -3.0, 0.0),
             limiter_release: ms_param("Limiter Release", d.limiter.release_ms as f32, 10.0, 500.0),
+            limiter_auto_release: BoolParam::new("Auto Release", d.limiter.auto_release),
+            clip_on: BoolParam::new("Clipper On", d.limiter.clip_on),
+            clip_db: db_param("Clip Above Ceiling", d.limiter.clip_db as f32, 0.5, 6.0),
+            compare: BoolParam::new("Compare 1:1", false),
 
             balance_on: BoolParam::new("Balance On", true),
             balance_static: opacity_param("Static Balance", 1.0),
             balance_moments: opacity_param("Moments", 1.0),
+            balance_width: opacity_param("Width Plan", 1.0),
+            genre: EnumParam::new("Genre", Genre::Neutral),
 
             target_lufs: FloatParam::new("Target", -14.0, FloatRange::Linear { min: -24.0, max: -6.0 })
                 .with_unit(" LUFS")
@@ -257,7 +310,20 @@ impl Default for StrataParams {
 }
 
 impl StrataParams {
-    fn settings(&self) -> Settings {
+    /// What the chain runs: the genre's preset with the user's trims, or the layers by hand (Neutral).
+    pub fn settings(&self) -> Settings {
+        with_genre(self.genre.value(), self.manual_settings())
+    }
+
+    /// The loudness target in use: the genre's, or the Target slider in Neutral.
+    pub fn target(&self) -> f64 {
+        match self.genre.value() {
+            Genre::Neutral => self.target_lufs.value() as f64,
+            g => g.preset().target_lufs,
+        }
+    }
+
+    fn manual_settings(&self) -> Settings {
         let f = |p: &FloatParam| p.value() as f64;
         Settings {
             order: unpack_order(self.layer_order.load(Ordering::Relaxed)),
@@ -278,21 +344,68 @@ impl StrataParams {
                 attack_ms: f(&self.glue_attack),
                 release_ms: f(&self.glue_release),
                 makeup_db: f(&self.glue_makeup),
+                sc_hpf_hz: f(&self.glue_sc_hpf),
             },
-            warmth: dsp::WarmthSettings { on: self.warmth_on.value(), opacity: f(&self.warmth_opacity), drive_db: f(&self.warmth_drive) },
+            warmth: dsp::WarmthSettings {
+                on: self.warmth_on.value(),
+                opacity: f(&self.warmth_opacity),
+                drive_db: f(&self.warmth_drive),
+                grit_db: f(&self.warmth_grit),
+            },
             width: dsp::WidthSettings {
                 on: self.width_on.value(),
                 opacity: f(&self.width_opacity),
                 width: f(&self.width_amount),
                 mono_below_hz: f(&self.width_mono_below),
+                linear_phase: self.width_linear.value(),
             },
             limiter: dsp::LimiterSettings {
                 on: self.limiter_on.value(),
                 gain_db: f(&self.limiter_gain),
                 ceiling_db: f(&self.limiter_ceiling),
                 release_ms: f(&self.limiter_release),
+                auto_release: self.limiter_auto_release.value(),
+                clip_on: self.clip_on.value(),
+                clip_db: f(&self.clip_db),
             },
         }
+    }
+}
+
+/// The chain for a genre. Neutral returns the manual settings unchanged. Otherwise Tone, Glue,
+/// Warmth and Width come from the genre (all on, fully opaque); the Tone dB sliders, Bass Grit and
+/// Width are trims on top; the layer order and the limiter stay the user's.
+pub fn with_genre(genre: Genre, manual: Settings) -> Settings {
+    if genre == Genre::Neutral {
+        return manual;
+    }
+    let p = genre.preset();
+    let d = Settings::default();
+    let m = &manual;
+    Settings {
+        order: m.order,
+        tone: dsp::ToneSettings {
+            on: true,
+            opacity: 1.0,
+            low_cut_hz: (p.low_cut_hz + (m.tone.low_cut_hz - d.tone.low_cut_hz)).clamp(10.0, 150.0),
+            low_db: p.low_db + m.tone.low_db,
+            mid_db: p.body_db + m.tone.mid_db,
+            presence_db: p.presence_db + m.tone.presence_db,
+            air_db: p.air_db + m.tone.air_db,
+        },
+        glue: dsp::GlueSettings {
+            on: true,
+            opacity: 1.0,
+            threshold_db: p.glue_threshold_db,
+            ratio: p.glue_ratio,
+            attack_ms: p.glue_attack_ms,
+            release_ms: p.glue_release_ms,
+            makeup_db: m.glue.makeup_db,
+            sc_hpf_hz: m.glue.sc_hpf_hz,
+        },
+        warmth: dsp::WarmthSettings { on: true, opacity: 1.0, drive_db: p.warmth_db, grit_db: p.grit_db + m.warmth.grit_db },
+        width: dsp::WidthSettings { on: true, opacity: 1.0, width: (p.width * m.width.width).clamp(0.0, 2.0), mono_below_hz: p.mono_below_hz, linear_phase: m.width.linear_phase },
+        limiter: m.limiter,
     }
 }
 
@@ -317,6 +430,7 @@ pub fn balance_now() -> String {
                 low: read(&c.low),
                 mid: read(&c.mid),
                 high: read(&c.high),
+                side: read(&c.side),
             }
         })
         .collect();
@@ -324,19 +438,22 @@ pub fn balance_now() -> String {
         return "Nothing learned yet: start learning, play the song, then balance.".into();
     }
     let bpb = cylinder::BEATS_PER_BAR.load(Ordering::Relaxed) as usize;
-    let plan = orchestra::plan(&inputs, bpb);
+    let genre = Genre::from_index(cylinder::GENRE.load(Ordering::Relaxed));
+    let plan = orchestra::plan_for(&inputs, bpb, genre);
     for (c, r) in cyls.iter().zip(&plan.tracks) {
-        c.set_plan(r.static_db as f32, &r.curve_db);
+        c.set_plan(r.static_db as f32, &r.curve_db, r.width as f32, r.mono_below_hz as f32);
     }
-    let mut text = String::new();
+    let mut text = format!("Genre: {}\n", genre.name());
     for r in &plan.tracks {
         let name = if r.label.is_empty() { format!("#{}", r.id) } else { r.label.clone() };
         text += &format!(
-            "{name:<14} {:<8}{} {:>6.1} dB loud  static {:+5.1}\n",
+            "{name:<14} {:<8}{} {:>6.1} dB loud  static {:+5.1}  width {:>3.0}%{}\n",
             r.role.name(),
             if r.role_guessed { "?" } else { " " },
             r.loudness_db,
-            r.static_db
+            r.static_db,
+            r.width * 100.0,
+            if r.width_note.is_empty() { String::new() } else { format!("  ({})", r.width_note) }
         );
     }
     text += &format!("{} moments over {} bars\n", plan.moments.len(), plan.beats.div_ceil(plan.beats_per_bar));
@@ -481,6 +598,13 @@ impl Default for Strata {
             was_playing: false,
             next_snapshot: 0.0,
             last_block: 0,
+            reported_latency: 0,
+            dry: [Vec::new(), Vec::new()],
+            dry_ring: [vec![0.0; 1], vec![0.0; 1]],
+            dry_pos: 0,
+            compare_gain: 1.0,
+            compare_coef: 0.0,
+            limiter_gr_max: 0.0,
         }
     }
 }
@@ -533,7 +657,17 @@ impl Plugin for Strata {
             if rebuilt { "rebuilt" } else { "kept" }
         ));
         self.corr_coef = (-1.0 / (0.3 * fs)).exp();
-        context.set_latency_samples(self.chain.latency() as u32);
+        let settings = self.params.settings();
+        self.reported_latency = self.chain.latency_with(&settings);
+        context.set_latency_samples(self.reported_latency as u32);
+        let mut longest = settings;
+        longest.width.linear_phase = true;
+        let ring = self.chain.latency_with(&longest) + 1;
+        let block = config.max_buffer_size as usize;
+        self.dry = [vec![0.0; block], vec![0.0; block]];
+        self.dry_ring = [vec![0.0; ring], vec![0.0; ring]];
+        self.dry_pos = 0;
+        self.compare_coef = (-1.0 / (0.05 * fs)).exp();
         self.inits += 1;
         true
     }
@@ -552,6 +686,7 @@ impl Plugin for Strata {
             self.st = [0.0, 0.0, 0.0, f64::INFINITY, f64::NEG_INFINITY];
             self.inits = 0;
             self.resets = 0;
+            self.limiter_gr_max = 0.0;
             self.meters.push_log(format!("{:8.1}s meters reset", self.clock / self.fs));
         }
         let t = context.transport();
@@ -584,6 +719,8 @@ impl Plugin for Strata {
         cylinder::BALANCE_ON.store(self.params.balance_on.value(), Ordering::Relaxed);
         cylinder::STATIC_AMOUNT.store(self.params.balance_static.value(), Ordering::Relaxed);
         cylinder::MOMENT_AMOUNT.store(self.params.balance_moments.value(), Ordering::Relaxed);
+        cylinder::WIDTH_AMOUNT.store(self.params.balance_width.value(), Ordering::Relaxed);
+        cylinder::GENRE.store(self.params.genre.value().index(), Ordering::Relaxed);
         let settings = self.params.settings();
         let channels = buffer.as_slice();
         let (left, right) = channels.split_at_mut(1);
@@ -611,6 +748,19 @@ impl Plugin for Strata {
         for (a, v) in es.iter().zip(vals) {
             a.store(v as f32, Ordering::Relaxed);
         }
+        let latency = self.chain.latency_with(&settings);
+        if latency != self.reported_latency {
+            self.reported_latency = latency;
+            context.set_latency_samples(latency as u32);
+            self.meters.push_log(format!("{now:8.1}s latency now {latency} samples"));
+        }
+        let frames_n = left.len();
+        if self.dry[0].len() < frames_n {
+            // Hosts should never exceed max_buffer_size; grow rather than fail if one does.
+            self.dry = [vec![0.0; frames_n], vec![0.0; frames_n]];
+        }
+        self.dry[0][..frames_n].copy_from_slice(left);
+        self.dry[1][..frames_n].copy_from_slice(right);
         let report = self.chain.process(left, right, &settings);
         let a = self.corr_coef;
         for (l, r) in left.iter().zip(right.iter()) {
@@ -622,6 +772,31 @@ impl Plugin for Strata {
             self.corr[0] = a * self.corr[0] + (1.0 - a) * l * r;
             self.corr[1] = a * self.corr[1] + (1.0 - a) * l * l;
             self.corr[2] = a * self.corr[2] + (1.0 - a) * r * r;
+        }
+
+        // 1:1 compare: the input, delayed like the chain and raised to the output's loudness, so the
+        // A/B judges the processing and not the level. Measured above, so the meters keep showing
+        // the processed output. Integrated loudness once both have it, short-term before that.
+        let ok = |v: f64| v.is_finite() && v > -70.0;
+        let (ii, oi) = (self.in_meter.integrated(), self.out_meter.integrated());
+        let (is, os) = (self.in_meter.short_term, self.out_meter.short_term);
+        let match_db = if ok(ii) && ok(oi) { oi - ii } else if ok(is) && ok(os) { os - is } else { 0.0 };
+        let match_db = match_db.clamp(-24.0, 24.0);
+        self.meters.compare_db.store(match_db as f32, Ordering::Relaxed);
+        let compare = self.params.compare.value();
+        let target = 10f64.powf(match_db / 20.0);
+        let len = self.dry_ring[0].len();
+        let lat = latency.min(len - 1);
+        for i in 0..frames_n {
+            self.dry_ring[0][self.dry_pos] = self.dry[0][i];
+            self.dry_ring[1][self.dry_pos] = self.dry[1][i];
+            let read = (self.dry_pos + len - lat) % len;
+            self.dry_pos = (self.dry_pos + 1) % len;
+            if compare {
+                self.compare_gain = target + (self.compare_gain - target) * self.compare_coef;
+                left[i] = (self.dry_ring[0][read] as f64 * self.compare_gain) as f32;
+                right[i] = (self.dry_ring[1][read] as f64 * self.compare_gain) as f32;
+            }
         }
 
         let m = &self.meters;
@@ -637,6 +812,10 @@ impl Plugin for Strata {
         m.correlation.store(if denom > 1e-12 { (self.corr[0] / denom) as f32 } else { 0.0 }, st);
         m.glue_gr.store(report.glue_gr_db as f32, st);
         m.limiter_gr.store(report.limiter_gr_db as f32, st);
+        if metering {
+            self.limiter_gr_max = self.limiter_gr_max.max(report.limiter_gr_db);
+        }
+        m.limiter_gr_max.store(self.limiter_gr_max as f32, st);
         if metering {
             self.next_snapshot -= n;
             if self.next_snapshot <= 0.0 {

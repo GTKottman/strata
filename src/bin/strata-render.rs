@@ -1,11 +1,19 @@
 //! Offline: run a stereo WAV through the default Strata chain and print loudness before and after.
-//! Usage: strata-render IN.wav OUT.wav [limiter-gain-dB] [ceiling-dBTP]
+//! Usage: strata-render IN.wav OUT.wav [limiter-gain-dB] [ceiling-dBTP] [--genre "Bass first"]
+//! With --genre the chain runs that genre's preset (as the plugin does with that genre picked).
 
 use strata::dsp::meter::LoudnessMeter;
 use strata::dsp::{Chain, Settings};
+use strata::genre::Genre;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args: Vec<String> = std::env::args().collect();
+    let mut args: Vec<String> = std::env::args().collect();
+    let mut genre = Genre::Neutral;
+    if let Some(i) = args.iter().position(|a| a == "--genre") {
+        let name = args.get(i + 1).cloned().ok_or("--genre needs a name")?;
+        genre = *Genre::ALL.iter().find(|g| g.name().eq_ignore_ascii_case(&name)).ok_or(format!("no genre {name}"))?;
+        args.drain(i..=i + 1);
+    }
     if args.len() < 3 {
         eprintln!("usage: strata-render IN.wav OUT.wav [limiter-gain-dB] [ceiling-dBTP]");
         std::process::exit(2);
@@ -26,7 +34,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut left: Vec<f32> = samples.iter().step_by(2).copied().collect();
     let mut right: Vec<f32> = samples.iter().skip(1).step_by(2).copied().collect();
 
-    let mut settings = Settings::default();
+    let mut settings = strata::with_genre(genre, Settings::default());
     if let Some(g) = args.get(3) {
         settings.limiter.gain_db = g.parse()?;
     }
