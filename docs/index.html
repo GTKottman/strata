@@ -1,0 +1,492 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Strata: mastering in layers</title>
+<meta name="description" content="Strata is a free VST3/CLAP mastering plugin built like adjustment layers, with an Engine that balances the whole mix from a Cylinder on every channel.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=IBM+Plex+Sans:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+:root {
+  /* ground and surfaces: the plugin's own window colours */
+  --bg: #18191d;
+  --surface: #212329;
+  --surface-2: #2a2c33;
+  --line: #34363f;
+  --text: #eceae4;
+  --text-2: #b9b6ad;
+  --text-3: #9a978f;
+  /* the plugin's accent, plus tints */
+  --accent: #e8a040;
+  --accent-ink: #1d1406;
+  --accent-soft: #f0bd78;
+  /* strata ramp (warm stone, darkest = bedrock) */
+  --s0: #2c2621; --s1: #3a3027; --s2: #4a3b2b; --s3: #5c472f; --s4: #6f5434; --s5: #84623a;
+  --link: #8cb8ff;
+
+  --sp-1: 4px; --sp-2: 8px; --sp-3: 12px; --sp-4: 16px; --sp-5: 24px; --sp-6: 32px;
+  --sp-7: 48px; --sp-8: 64px; --sp-9: 96px;
+  --fs-12: 12px; --fs-14: 14px; --fs-16: 16px; --fs-18: 18px; --fs-20: 20px; --fs-24: 24px;
+  --fs-30: 30px; --fs-48: 48px; --fs-72: 72px;
+  --r: 6px;
+  --h-ctl: 44px;
+  --measure: 66ch;
+  --page: 1120px;
+  --display: "Bricolage Grotesque", "IBM Plex Sans", system-ui, sans-serif;
+  --body: "IBM Plex Sans", system-ui, sans-serif;
+}
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+@media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
+body {
+  margin: 0; background: var(--bg); color: var(--text);
+  font: 400 var(--fs-16)/1.6 var(--body);
+  -webkit-font-smoothing: antialiased;
+}
+a { color: var(--link); text-underline-offset: 3px; }
+a:focus-visible, button:focus-visible { outline: 2px solid var(--accent-soft); outline-offset: 3px; border-radius: 2px; }
+code, pre { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 0.9em; }
+code { background: var(--surface-2); padding: 1px 6px; border-radius: 4px; }
+pre { background: var(--surface); padding: var(--sp-4) var(--sp-5); border-radius: var(--r); overflow-x: auto; line-height: 1.5; margin: 0; }
+pre code { background: none; padding: 0; }
+
+.wrap { max-width: var(--page); margin: 0 auto; padding: 0 var(--sp-5); }
+
+/* top bar */
+.bar { border-bottom: 1px solid var(--line); }
+.bar .wrap { display: flex; align-items: center; gap: var(--sp-5); height: 64px; }
+.brand { font: 700 var(--fs-20)/1 var(--display); color: var(--text); text-decoration: none; letter-spacing: -0.01em; margin-right: auto; }
+.bar nav { display: flex; gap: var(--sp-5); }
+.bar nav a { color: var(--text-2); text-decoration: none; font-size: var(--fs-14); font-weight: 500; }
+.bar nav a:hover { color: var(--text); text-decoration: underline; }
+.bar .gh { color: var(--text); font-size: var(--fs-14); font-weight: 500; }
+
+/* hero */
+.hero { padding: var(--sp-8) 0 var(--sp-9); }
+.hero .wrap { display: grid; grid-template-columns: minmax(0, 5fr) minmax(0, 6fr); gap: var(--sp-7); align-items: center; }
+h1 { font: 700 var(--fs-72)/1.0 var(--display); letter-spacing: -0.035em; margin: 0 0 var(--sp-5); }
+.lede { font-size: var(--fs-20); line-height: 1.5; color: var(--text-2); margin: 0 0 var(--sp-6); max-width: 34ch; }
+.lede strong { color: var(--text); font-weight: 500; }
+.actions { display: flex; flex-wrap: wrap; gap: var(--sp-3); align-items: center; }
+.btn {
+  display: inline-flex; align-items: center; height: var(--h-ctl); padding: 0 var(--sp-5);
+  border-radius: var(--r); font: 500 var(--fs-16)/1 var(--body); text-decoration: none;
+}
+.btn-primary { background: var(--accent); color: var(--accent-ink); font-weight: 700; }
+.btn-primary:hover { background: var(--accent-soft); }
+.btn-secondary { color: var(--text); box-shadow: inset 0 0 0 1px var(--line); }
+.btn-secondary:hover { box-shadow: inset 0 0 0 1px var(--text-3); }
+.fine { margin: var(--sp-4) 0 0; font-size: var(--fs-14); color: var(--text-3); }
+
+.strata svg { width: 100%; height: auto; display: block; }
+.strata figcaption { font-size: var(--fs-14); color: var(--text-3); margin-top: var(--sp-3); }
+
+/* sections */
+section { padding: var(--sp-8) 0; border-top: 1px solid var(--line); }
+h2 { font: 700 var(--fs-48)/1.1 var(--display); letter-spacing: -0.025em; margin: 0 0 var(--sp-4); }
+h3 { font: 700 var(--fs-20)/1.3 var(--display); margin: 0 0 var(--sp-2); }
+.intro { font-size: var(--fs-18); color: var(--text-2); max-width: var(--measure); margin: 0 0 var(--sp-7); }
+p { max-width: var(--measure); }
+
+/* two plugins */
+.pair { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--sp-6); margin-bottom: var(--sp-7); }
+.pair > div { border-top: 2px solid var(--s5); padding-top: var(--sp-4); }
+.pair .where { color: var(--text-3); font-size: var(--fs-14); margin: 0 0 var(--sp-3); }
+.pair p { margin: 0; color: var(--text-2); }
+.flow { background: var(--surface); border-radius: var(--r); padding: var(--sp-5); }
+.flow svg { width: 100%; height: auto; display: block; }
+.flow .tall { display: none; max-width: 420px; }
+
+/* steps */
+.steps { list-style: none; margin: 0; padding: 0; counter-reset: step; display: grid; gap: 0; }
+.steps li {
+  counter-increment: step; display: grid; grid-template-columns: 56px minmax(0, 1fr); gap: var(--sp-4);
+  padding: var(--sp-5) 0; border-bottom: 1px solid var(--line);
+}
+.steps li:first-child { padding-top: 0; }
+.steps li::before {
+  content: counter(step); font: 700 var(--fs-30)/1 var(--display); color: var(--s5);
+  font-variant-numeric: tabular-nums;
+}
+.steps p { margin: 0; color: var(--text-2); }
+.steps b { color: var(--text); font-weight: 500; }
+.after { margin: var(--sp-6) 0 0; color: var(--text-2); }
+
+/* plan */
+.plan { display: grid; grid-template-columns: minmax(0, 5fr) minmax(0, 6fr); gap: var(--sp-7); align-items: start; }
+.plan dl { margin: 0; }
+.plan dt { font: 700 var(--fs-18)/1.3 var(--display); margin: 0 0 var(--sp-1); }
+.plan dd { margin: 0 0 var(--sp-5); color: var(--text-2); }
+.chart { background: var(--surface); border-radius: var(--r); padding: var(--sp-5); }
+.chart svg { width: 100%; height: auto; display: block; }
+.chart figcaption { font-size: var(--fs-14); color: var(--text-3); margin-top: var(--sp-3); }
+
+/* tables */
+.table-wrap { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; font-size: var(--fs-16); }
+th { text-align: left; font-weight: 500; color: var(--text-3); font-size: var(--fs-14); padding: 0 var(--sp-4) var(--sp-3) 0; border-bottom: 1px solid var(--line); }
+td { padding: var(--sp-3) var(--sp-4) var(--sp-3) 0; border-bottom: 1px solid var(--line); vertical-align: top; color: var(--text-2); }
+td:first-child { color: var(--text); font-weight: 500; white-space: nowrap; }
+td.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+th.num { text-align: right; }
+
+.cols { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--sp-7); }
+.cols ol { margin: 0; padding-left: 1.2em; color: var(--text-2); }
+.cols li { margin-bottom: var(--sp-2); }
+.cols li b { color: var(--text); font-weight: 500; }
+
+footer { border-top: 1px solid var(--line); padding: var(--sp-6) 0 var(--sp-7); color: var(--text-3); font-size: var(--fs-14); }
+footer .wrap { display: flex; flex-wrap: wrap; gap: var(--sp-4); justify-content: space-between; }
+
+@media (max-width: 900px) {
+  .hero .wrap, .plan, .cols { grid-template-columns: minmax(0, 1fr); }
+  .hero { padding-top: var(--sp-7); }
+  .lede { max-width: none; }
+  h1 { font-size: var(--fs-48); }
+  h2 { font-size: var(--fs-30); }
+  .bar nav { display: none; }
+}
+@media (max-width: 600px) {
+  .wrap { padding: 0 var(--sp-4); }
+  .pair { grid-template-columns: minmax(0, 1fr); }
+  .steps li { grid-template-columns: 40px minmax(0, 1fr); }
+  section { padding: var(--sp-7) 0; }
+  .flow .wide { display: none; }
+  .flow .tall { display: block; }
+  .strata .sub { display: none; }
+  .strata svg text { font-size: 26px; }
+  .chart svg text { font-size: 22px; }
+  .chart svg text.val { font-size: 17px; }
+}
+</style>
+</head>
+<body>
+
+<header class="bar">
+  <div class="wrap">
+    <a class="brand" href="#top">Strata</a>
+    <nav aria-label="Sections">
+      <a href="#balance">Engine + Cylinders</a>
+      <a href="#process">Process</a>
+      <a href="#layers">Layers</a>
+      <a href="#install">Install</a>
+    </nav>
+    <a class="gh" href="https://github.com/GTKottman/strata">GitHub</a>
+  </div>
+</header>
+
+<main id="top">
+
+<div class="hero">
+  <div class="wrap">
+    <div>
+      <h1>Mastering in layers.</h1>
+      <p class="lede">A free mastering plugin you stack like adjustment layers, and an <strong>Engine that balances the whole mix</strong> from a Cylinder on every channel. Learn the song once, and every render comes out the same.</p>
+      <div class="actions">
+        <a class="btn btn-primary" href="https://github.com/GTKottman/strata/releases/latest">Download for Windows</a>
+        <a class="btn btn-secondary" href="https://github.com/GTKottman/strata">Source on GitHub</a>
+      </div>
+      <p class="fine">VST3 and CLAP, 64-bit. Builds on Linux too. GPL-3.0.</p>
+    </div>
+
+    <figure class="strata" style="margin:0">
+      <svg viewBox="0 0 600 380" role="img" aria-labelledby="strata-title">
+        <title id="strata-title">The Strata chain as layers of rock: your mix at the bottom, then Tone, Glue, Warmth and Width, with the limiter on top</title>
+        <!-- bands, top to bottom; each top edge is a gentle fold -->
+        <path d="M0 18 C 90 6, 170 26, 260 14 S 380 4, 420 16 L420 380 L0 380 Z" fill="#84623a"/>
+        <path d="M0 76 C 80 64, 160 86, 250 72 S 370 62, 420 74 L420 380 L0 380 Z" fill="#6f5434"/>
+        <path d="M0 136 C 100 124, 190 146, 280 130 S 380 124, 420 134 L420 380 L0 380 Z" fill="#5c472f"/>
+        <path d="M0 196 C 70 206, 170 184, 260 196 S 370 206, 420 192 L420 380 L0 380 Z" fill="#4a3b2b"/>
+        <path d="M0 256 C 110 244, 200 266, 300 252 S 390 248, 420 256 L420 380 L0 380 Z" fill="#3a3027"/>
+        <path d="M0 316 C 90 308, 190 326, 280 312 S 380 306, 420 316 L420 380 L0 380 Z" fill="#2c2621"/>
+        <!-- labels sit beside the rock, on each band's line -->
+        <g font-family="IBM Plex Sans, system-ui, sans-serif" font-size="15">
+          <g fill="#eceae4" font-weight="500">
+            <text x="440" y="50">Limiter</text>
+            <text x="440" y="110">Width</text>
+            <text x="440" y="170">Warmth</text>
+            <text x="440" y="230">Glue</text>
+            <text x="440" y="290">Tone</text>
+            <text x="440" y="352">Your mix</text>
+          </g>
+          <g class="sub" fill="#9a978f" font-size="13">
+            <text x="440" y="68">always last</text>
+            <text x="440" y="128">mid/side, mono bass</text>
+            <text x="440" y="188">tape-like saturation</text>
+            <text x="440" y="248">bus compressor</text>
+            <text x="440" y="308">mastering EQ</text>
+          </g>
+        </g>
+        <g stroke="#34363f" stroke-width="1">
+          <line x1="426" y1="45" x2="434" y2="45"/>
+          <line x1="426" y1="105" x2="434" y2="105"/>
+          <line x1="426" y1="165" x2="434" y2="165"/>
+          <line x1="426" y1="225" x2="434" y2="225"/>
+          <line x1="426" y1="285" x2="434" y2="285"/>
+          <line x1="426" y1="347" x2="434" y2="347"/>
+        </g>
+      </svg>
+      <figcaption>Each layer has on/off and opacity, and the middle four can be reordered. The limiter always sits on top.</figcaption>
+    </figure>
+  </div>
+</div>
+
+<section id="balance">
+  <div class="wrap">
+    <h2>Engine + Cylinders</h2>
+    <p class="intro">Strata balances the mix for you, once per song, and then holds it still. It is not auto-gain that keeps reacting: it learns the song in one pass, plans every channel from what it heard, and plays that plan back locked to the song position.</p>
+
+    <div class="pair">
+      <div>
+        <h3>Strata Cylinder</h3>
+        <p class="where">First insert slot of every instrument's mixer track</p>
+        <p>Listens to its channel while learning: level, attacks, low, mid and high bands and stereo width, beat by beat. After the balance it becomes that channel's gain and width stage.</p>
+      </div>
+      <div>
+        <h3>Strata, the Engine</h3>
+        <p class="where">The Master track</p>
+        <p>The mastering chain and meters, plus the brain: it starts and stops learning, makes the plan, and sends each Cylinder its part. Both plugins ship in the same file and find each other in the host.</p>
+      </div>
+    </div>
+
+    <figure class="flow" style="margin:0">
+      <svg class="wide" viewBox="0 0 720 270" role="img" aria-labelledby="flow-title">
+        <title id="flow-title">Four channels, each with a Cylinder, feed the Engine on the Master. The Engine sends a plan back to every Cylinder.</title>
+        <defs>
+          <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L10 5 L0 10 Z" fill="#9a978f"/></marker>
+          <marker id="arr2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L10 5 L0 10 Z" fill="#84623a"/></marker>
+        </defs>
+        <g font-family="IBM Plex Sans, system-ui, sans-serif" font-size="15">
+          <!-- channels -->
+          <g fill="#2a2c33">
+            <rect x="0" y="12" width="130" height="44" rx="6"/>
+            <rect x="0" y="80" width="130" height="44" rx="6"/>
+            <rect x="0" y="148" width="130" height="44" rx="6"/>
+            <rect x="0" y="216" width="130" height="44" rx="6"/>
+          </g>
+          <g fill="#eceae4">
+            <text x="16" y="39">Drums</text>
+            <text x="16" y="107">Bass</text>
+            <text x="16" y="175">Lead vocal</text>
+            <text x="16" y="243">Pad</text>
+          </g>
+          <!-- cylinders -->
+          <g fill="#4a3b2b">
+            <rect x="180" y="12" width="120" height="44" rx="22"/>
+            <rect x="180" y="80" width="120" height="44" rx="22"/>
+            <rect x="180" y="148" width="120" height="44" rx="22"/>
+            <rect x="180" y="216" width="120" height="44" rx="22"/>
+          </g>
+          <g fill="#eceae4" text-anchor="middle">
+            <text x="240" y="39">Cylinder</text>
+            <text x="240" y="107">Cylinder</text>
+            <text x="240" y="175">Cylinder</text>
+            <text x="240" y="243">Cylinder</text>
+          </g>
+          <g stroke="#9a978f" stroke-width="1.5" fill="none" marker-end="url(#arr)">
+            <line x1="130" y1="34" x2="176" y2="34"/>
+            <line x1="130" y1="102" x2="176" y2="102"/>
+            <line x1="130" y1="170" x2="176" y2="170"/>
+            <line x1="130" y1="238" x2="176" y2="238"/>
+            <path d="M300 34 C 370 34, 380 120, 456 128"/>
+            <path d="M300 102 C 370 102, 390 126, 456 132"/>
+            <path d="M300 170 C 370 170, 390 140, 456 138"/>
+            <path d="M300 238 C 370 238, 380 150, 456 144"/>
+          </g>
+          <!-- plan back -->
+          <g stroke="#84623a" stroke-width="1.5" stroke-dasharray="4 5" fill="none" marker-end="url(#arr2)">
+            <path d="M520 96 C 500 40, 420 22, 304 22"/>
+            <path d="M520 180 C 500 236, 420 252, 304 252"/>
+          </g>
+          <!-- engine -->
+          <rect x="460" y="100" width="260" height="76" rx="6" fill="#6f5434"/>
+          <text x="480" y="132" fill="#eceae4" font-weight="700" font-size="17">Strata Engine</text>
+          <text x="480" y="156" fill="#eceae4" font-size="13">on the Master: layers, limiter, meters</text>
+          <text x="560" y="40" fill="#b9b6ad" font-size="13">plan per channel</text>
+        </g>
+      </svg>
+      <svg class="tall" viewBox="0 0 360 370" role="img" aria-labelledby="flow-title-2">
+        <defs><marker id="arr-t" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L10 5 L0 10 Z" fill="#9a978f"/></marker><marker id="arr2-t" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L10 5 L0 10 Z" fill="#84623a"/></marker></defs>
+        <title id="flow-title-2">Four channels, each with a Cylinder, feed the Engine on the Master. The Engine sends a plan back to every Cylinder.</title>
+        <g font-family="IBM Plex Sans, system-ui, sans-serif" font-size="15">
+          <g fill="#2a2c33">
+            <rect x="0" y="0" width="110" height="44" rx="6"/><rect x="0" y="60" width="110" height="44" rx="6"/>
+            <rect x="0" y="120" width="110" height="44" rx="6"/><rect x="0" y="180" width="110" height="44" rx="6"/>
+          </g>
+          <g fill="#eceae4">
+            <text x="12" y="27">Drums</text><text x="12" y="87">Bass</text>
+            <text x="12" y="147">Lead vocal</text><text x="12" y="207">Pad</text>
+          </g>
+          <g fill="#4a3b2b">
+            <rect x="150" y="0" width="140" height="44" rx="22"/><rect x="150" y="60" width="140" height="44" rx="22"/>
+            <rect x="150" y="120" width="140" height="44" rx="22"/><rect x="150" y="180" width="140" height="44" rx="22"/>
+          </g>
+          <g fill="#eceae4" text-anchor="middle">
+            <text x="220" y="27">Cylinder</text><text x="220" y="87">Cylinder</text>
+            <text x="220" y="147">Cylinder</text><text x="220" y="207">Cylinder</text>
+          </g>
+          <g stroke="#9a978f" stroke-width="1.5" fill="none">
+            <line x1="110" y1="22" x2="146" y2="22" marker-end="url(#arr-t)"/><line x1="110" y1="82" x2="146" y2="82" marker-end="url(#arr-t)"/>
+            <line x1="110" y1="142" x2="146" y2="142" marker-end="url(#arr-t)"/><line x1="110" y1="202" x2="146" y2="202" marker-end="url(#arr-t)"/>
+            <path d="M290 22 H345 M290 82 H345 M290 142 H345 M290 202 H345"/>
+            <line x1="345" y1="22" x2="345" y2="286" marker-end="url(#arr-t)"/>
+          </g>
+          <line x1="220" y1="288" x2="220" y2="230" stroke="#84623a" stroke-width="1.5" stroke-dasharray="4 5" marker-end="url(#arr2-t)"/>
+          <text x="230" y="264" fill="#b9b6ad" font-size="13">plan per channel</text>
+          <rect x="0" y="292" width="360" height="76" rx="6" fill="#6f5434"/>
+          <text x="20" y="324" fill="#eceae4" font-weight="700" font-size="17">Strata Engine</text>
+          <text x="20" y="348" fill="#eceae4" font-size="13">on the Master: layers, limiter, meters</text>
+        </g>
+      </svg>
+    </figure>
+  </div>
+</section>
+
+<section id="process">
+  <div class="wrap">
+    <h2>The process, once per song</h2>
+    <p class="intro">Five steps. Channel faders stay at 0 dB: the Cylinders set the levels, and a fader still applies after its Cylinder.</p>
+    <ol class="steps">
+      <li><div><h3>Set up</h3><p>Route every instrument to its own mixer track and put a <b>Strata Cylinder</b> in slot 1 of each. Give it a name and a role, or leave it on Auto and it guesses from what it hears. Put <b>Strata</b> on the Master and pick a genre, or Neutral.</p></div></li>
+      <li><div><h3>Learn</h3><p>In the Engine's Balance card press <b>Start learning</b>, then play or render the whole song from the start. Each Cylinder counts the beats it learned.</p></div></li>
+      <li><div><h3>Balance</h3><p>Press <b>Stop learning + Balance</b>. The Engine plans every channel and the Cylinders follow it straight away. The card lists each channel's role, gain and width, and a report is written.</p></div></li>
+      <li><div><h3>Set the loudness</h3><p>Press <b>Reset meters</b>, play or render the whole song again, then <b>Apply to limiter input gain</b>. The balanced mix now meets the loudness target: the genre's, or the Target slider in Neutral.</p></div></li>
+      <li><div><h3>Render</h3><p>Export the final mix. The plan is saved with the project, so reopening it plays the same balance.</p></div></li>
+    </ol>
+    <p class="after">Learn again only when the arrangement changes. After changing roles, trims or the genre, <b style="color:var(--text);font-weight:500">Balance again</b> re-plans from what was already learned without replaying the song.</p>
+  </div>
+</section>
+
+<section id="plan">
+  <div class="wrap">
+    <h2>What the plan does</h2>
+    <p class="intro">Three parts, each with its own slider on the Engine (0 to 100 %), and a Balance switch that turns the whole plan off.</p>
+    <div class="plan">
+      <dl>
+        <dt>Static balance</dt>
+        <dd>Each channel's loudness, while it plays, moves towards the genre's level for its role. Neutral: drums 0, bass −2, lead −1, keys −5, pad −9, texture −15 dB against the mix. At most ±9 dB.</dd>
+        <dt>Moments</dt>
+        <dd>Beat by beat, for Lead and Keys parts. One part moving alone comes up 3 dB, two moving 1.5 dB each, and in a crowd only the busiest stays forward. Pads, drones and textures sit back 1.5 dB while something moves. Drums and bass are never pushed around, so the groove doesn't pump.</dd>
+        <dt>Width</dt>
+        <dd>Each channel gets the genre's width for its role: bass mono, pads wide. A channel that is already wide is capped, and a mono one can't be widened; the report says which.</dd>
+      </dl>
+
+      <figure class="chart" style="margin:0">
+        <svg viewBox="0 0 560 300" role="img" aria-labelledby="chart-title">
+          <title id="chart-title">Example over 16 bars: the lead comes up 3 dB during its solo in bars 5 to 8 while the pad sits back 1.5 dB; drums stay level.</title>
+          <!-- solo region bars 5-8: x = 80 + (bar - 1) * 28.75 -->
+          <rect x="195" y="22" width="115" height="238" fill="#2a2c33"/>
+          <g font-family="IBM Plex Sans, system-ui, sans-serif" font-size="12" fill="#9a978f">
+            <text x="252" y="16" text-anchor="middle" fill="#b9b6ad">solo</text>
+            <text x="80" y="284">bar 1</text>
+            <text x="195" y="284">5</text>
+            <text x="310" y="284">9</text>
+            <text x="425" y="284">13</text>
+            <text x="540" y="284" text-anchor="end">17</text>
+          </g>
+          <!-- lane zero lines -->
+          <g stroke="#34363f" stroke-width="1">
+            <line x1="80" y1="96" x2="540" y2="96"/>
+            <line x1="80" y1="150" x2="540" y2="150"/>
+            <line x1="80" y1="240" x2="540" y2="240"/>
+          </g>
+          <!-- lead lane: 0 at y96, +3 dB at y40 -->
+          <path d="M80 96 L176 96 C 190 96, 188 40, 206 40 L294 40 C 312 40, 310 96, 324 96 L540 96" stroke="#f0bd78" stroke-width="3" fill="none"/>
+          <!-- pad lane: 0 at y150, -1.5 dB at y196 -->
+          <path d="M80 150 L176 150 C 190 150, 188 196, 206 196 L294 196 C 312 196, 310 150, 324 150 L540 150" stroke="#c89a63" stroke-width="2.5" fill="none"/>
+          <!-- drums lane: flat -->
+          <path d="M80 240 L540 240" stroke="#9a978f" stroke-width="2.5" fill="none"/>
+          <g font-family="IBM Plex Sans, system-ui, sans-serif" font-size="13" font-weight="500">
+            <text x="0" y="100" fill="#f0bd78">Lead</text>
+            <text x="0" y="154" fill="#c89a63">Pad</text>
+            <text x="0" y="244" fill="#b9b6ad">Drums</text>
+            <text class="val" x="252" y="62" text-anchor="middle" fill="#f0bd78">+3 dB</text>
+            <text class="val" x="252" y="188" text-anchor="middle" fill="#c89a63">−1.5 dB</text>
+            <text class="val" x="252" y="232" text-anchor="middle" fill="#b9b6ad">0 dB</text>
+          </g>
+        </svg>
+        <figcaption>Example: a lead solo over a pad and drums. Changes are smoothed over 3 beats and land a quarter beat early, so a lift is there when the note is.</figcaption>
+      </figure>
+    </div>
+  </div>
+</section>
+
+<section id="roles">
+  <div class="wrap">
+    <h2>Roles</h2>
+    <p class="intro">Set on each Cylinder. A role decides how the plan treats the channel, not how it sounds on its own.</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Role</th><th>Use it for</th><th>In the plan</th><th class="num">Neutral level</th></tr></thead>
+        <tbody>
+          <tr><td>Drums</td><td>Kits, loops, percussion</td><td>Fixed level, never moved by moments</td><td class="num">0 dB</td></tr>
+          <tr><td>Bass</td><td>Bass, sub, 808</td><td>Fixed level</td><td class="num">−2 dB</td></tr>
+          <tr><td>Lead</td><td>Lead vocal, solo instrument</td><td>Can be featured</td><td class="num">−1 dB</td></tr>
+          <tr><td>Keys</td><td>Piano, guitar, any moving melodic line</td><td>Can be featured</td><td class="num">−5 dB</td></tr>
+          <tr><td>Pad</td><td>Pads, drones, held chords</td><td>A bed: sits back while something moves</td><td class="num">−9 dB</td></tr>
+          <tr><td>Texture</td><td>Noise, risers, rain, ambience</td><td>A bed, quietest</td><td class="num">−15 dB</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="after">On a Cylinder, <b style="color:var(--text);font-weight:500">Trim</b> (−24 to +12 dB) sits on top of the plan, for example about −6 dB on a vocal that sits too far forward, and <b style="color:var(--text);font-weight:500">Follow Engine</b> off takes one channel out of it. Every balance writes <code>Documents\Strata\report.json</code> with each channel's role, loudness, gain, width and per-bar curve, plus the list of moments.</p>
+  </div>
+</section>
+
+<section id="layers">
+  <div class="wrap">
+    <h2>The layers</h2>
+    <p class="intro">On and off and opacity changes are ramped, so they never click. Pick a genre and Tone, Glue, Warmth and Width follow it; the sliders become trims on top.</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Layer</th><th>What it does</th><th>Controls</th></tr></thead>
+        <tbody>
+          <tr><td>Tone</td><td>Mastering EQ, Presence and Air matched to the analog curve up to Nyquist</td><td>Low cut, Low shelf 110 Hz, Body 400 Hz, Presence 3 kHz, Air 10 kHz (±6 dB)</td></tr>
+          <tr><td>Glue</td><td>Stereo-linked bus compressor with a high-passed detector, so kick and bass don't drive it</td><td>Threshold, Ratio, Attack, Release, Makeup, Sidechain HPF</td></tr>
+          <tr><td>Warmth</td><td>Soft saturation, 4× oversampled, plus grit on the bass band</td><td>Drive, Bass grit</td></tr>
+          <tr><td>Width</td><td>Mid/side width with bass to mono, optional linear phase</td><td>Width 0–200 %, Mono below, Linear phase</td></tr>
+          <tr><td>Limiter</td><td>True-peak limiter with lookahead, program-dependent release and an optional clipper</td><td>Input gain, Ceiling, Release, Auto release, Clipper</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="after">Meters follow EBU R128 / ITU-R BS.1770-4: integrated, short-term and momentary loudness, true-peak, correlation and gain reduction. <b style="color:var(--text);font-weight:500">Compare 1:1</b> plays the input at the output's loudness, so you judge the processing, not the level.</p>
+  </div>
+</section>
+
+<section id="install">
+  <div class="wrap">
+    <h2>Install</h2>
+    <div class="cols">
+      <div>
+        <h3>Windows</h3>
+        <ol>
+          <li>Download <b>Strata-windows.zip</b> from the <a href="https://github.com/GTKottman/strata/releases/latest">latest release</a> and unzip it.</li>
+          <li>VST3: copy the <code>Strata.vst3</code> folder to <code>C:\Program Files\Common Files\VST3\</code></li>
+          <li>CLAP: copy <code>Strata.clap</code> to <code>C:\Program Files\Common Files\CLAP\</code></li>
+          <li>In FL Studio: Options, Manage plugins, Find more plugins. <b>Strata</b> goes on the Master, <b>Strata Cylinder</b> on each channel.</li>
+        </ol>
+      </div>
+      <div>
+        <h3>Build from source</h3>
+<pre><code>cargo test --lib
+./build-windows.sh
+cargo run --release --bin strata-render -- \
+  in.wav out.wav [limiter-gain-dB] [ceiling-dBTP]</code></pre>
+        <p style="color:var(--text-2)">Rust with nih-plug. <code>build-windows.sh</code> cross-compiles with cargo-xwin. <code>strata-render</code> runs the default chain offline and prints loudness before and after.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <div class="wrap">
+    <span>Strata by GTKottman. GPL-3.0-or-later.</span>
+    <a href="https://github.com/GTKottman/strata">github.com/GTKottman/strata</a>
+  </div>
+</footer>
+
+</body>
+</html>

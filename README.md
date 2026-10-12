@@ -3,7 +3,10 @@
 A mastering plugin built like a stack of adjustment layers. Four layers you can reorder, each with
 on/off and **opacity** (how much of the layer is blended over what is below it), and a true-peak
 limiter that always sits last. Loudness meters (EBU R128 / ITU-R BS.1770-4) show input and output,
-with a loudness target and a one-click "gain to target".
+with a loudness target and a one-click "gain to target". Put a Strata Cylinder on every channel and
+the Engine balances the whole mix for you (see [Engine + Cylinders](#engine--cylinders-auto-balance)).
+
+Site: https://gtkottman.github.io/strata/
 
 VST3 and CLAP, 64-bit Windows (built here by cross-compiling from Linux). Linux builds work too.
 
@@ -30,28 +33,88 @@ plus 42.5 ms while Width's linear phase is on.
 
 ## Engine + Cylinders (auto-balance)
 
-The DLL holds two plugins. **Strata** on the Master is the Engine; **Strata Cylinder** goes on every
-instrument's mixer track (first insert slot). They find each other inside the host process.
+Strata balances a whole mix for you, once per song, and then holds that balance still. It is not
+free-running auto-gain: it **learns** the song in one pass, **plans** every channel's level from
+what it heard, and then plays that plan back locked to the song position, the same way on every
+playback and every render.
 
-1. Put a Cylinder on each channel. Give it a name and a role (Drums, Bass, Lead, Keys, Pad, Texture),
-   or leave Auto and it guesses from what it hears.
-2. In the Engine's BALANCE card press **Start learning**, play the whole song from the start, then
-   **Stop learning + Balance**.
-3. Each Cylinder now plays back its plan, locked to the song position:
-   - **Static balance**: whole-song level towards a role template (drums 0, bass -2, lead -1,
-     keys -5, pad -9, texture -15 dB relative to the mix), at most +-9 dB.
-   - **Moments**, per beat; only Lead and Keys parts can be featured (Pad and Texture are always beds): one part moving alone (a solo or near-solo) +3 dB,
-     two moving +1.5 dB each, crowded sections (4+) keep only the busiest forward and pull the rest
-     back 1.5 dB; held drones/pads/texture sit back 1.5 dB while something moves. Drums and bass are
-     left alone. Smoothed over 3 beats, read a quarter beat ahead.
-4. Scale both with the Static balance and Moments sliders, switch the plan off with the BALANCE
-   toggle, or per channel with "Follow Engine". Plans are saved with the project.
+The DLL holds two plugins that find each other inside the host:
 
-Each balance writes `Documents\Strata\report.json`: every channel's role, loudness, static offset and
-per-bar curve, plus the list of moments (bars, who is featured, who sits back).
+| Plugin | Where it goes | What it does |
+|---|---|---|
+| **Strata Cylinder** | First insert slot of **every** instrument's mixer track | Listens to its channel while learning (level, attacks, low/mid/high bands, stereo side, per beat), then becomes that channel's gain and width stage |
+| **Strata** (the Engine) | The **Master** track | The mastering chain (layers + limiter + meters) and the brain: starts and stops learning, makes the plan, sends each Cylinder its part |
 
-Cylinders adjust their own gain; FL's faders still apply after them, so set faders to 0 dB if you
-want the Engine to own the balance.
+```mermaid
+flowchart LR
+  subgraph Channels
+    D[Drums] --> CD[Cylinder]
+    B[Bass] --> CB[Cylinder]
+    L[Lead vocal] --> CL[Cylinder]
+    P[Pad] --> CP[Cylinder]
+  end
+  CD & CB & CL & CP --> M["Strata Engine on Master<br/>Tone · Glue · Warmth · Width · Limiter"]
+  M -. plan per channel .-> CD & CB & CL & CP
+```
+
+### The process, once per song
+
+1. **Set up.** Route every instrument to its own mixer track and put a **Strata Cylinder** in slot 1
+   of each. Name it and give it a role (below), or leave it on Auto and it guesses from what it
+   hears. Put **Strata** on the Master and pick a **Genre** (or Neutral). Leave the channel faders at
+   0 dB: Cylinders set the levels, and faders still apply after them.
+2. **Learn.** In the Engine's BALANCE card press **Start learning**, then play or render the whole
+   song from the start. Each Cylinder counts the beats it learned.
+3. **Balance.** Press **Stop learning + Balance**. The Engine plans every channel and the Cylinders
+   start following it at once. The card lists each channel's role, gain and width.
+4. **Set the loudness.** Press **Reset meters**, play or render the whole song again, then
+   **Apply to limiter input gain**. This brings the balanced mix to the loudness target (the
+   genre's, or the Target slider in Neutral).
+5. **Render** the final mix.
+
+The plan is saved with the project, so reopening it plays the same balance. Learn again (steps 2-3)
+only when the arrangement changes. After changing roles, trims or the genre, **Balance again**
+re-plans from what was already learned without replaying the song.
+
+### Roles
+
+| Role | Use it for | How the plan treats it |
+|---|---|---|
+| Drums | Kits, loops, percussion | Fixed level, never boosted or ducked by moments |
+| Bass | Bass, sub, 808 | Fixed level, mono |
+| Lead | Lead vocal, solo instrument | Can be featured |
+| Keys | Piano, guitars, any moving melodic line | Can be featured |
+| Pad | Pads, drones, held chords | A bed: sits back while something moves |
+| Texture | Noise, risers, rain, ambience | A bed, quietest by default |
+
+### What the plan does
+
+- **Static balance** (whole song): each channel's loudness while it plays is moved towards the
+  genre's level for its role. Neutral: drums 0, bass -2, lead -1, keys -5, pad -9, texture -15 dB
+  relative to the mix. At most +-9 dB.
+- **Moments** (per beat, Lead and Keys only): one part moving alone, a solo or near-solo, comes up
+  +3 dB; two moving +1.5 dB each; three moving, the busiest +1 dB; four or more, the busiest +1 dB and
+  the other movers -1.5 dB. Pads, drones and textures sit back 1.5 dB while something moves; a lone
+  held melodic part with nothing moving is the feature (+1.5 dB). Smoothed over 3 beats, read a
+  quarter beat ahead so a boost arrives with the note, at most +-6 dB.
+- **Width** (whole song): each channel gets the genre's width for its role (bass mono, pads wide),
+  capped so an already-wide channel never ends with its side louder than 2.2 dB under its middle.
+  A mono channel can't be widened, and the report says so.
+
+### Steering it
+
+- Engine: **Static balance**, **Moments** and **Width plan** sliders scale each part of the plan
+  (0-100 %); the **BALANCE** toggle switches the whole plan off.
+- Cylinder: **Trim** (-24 to +12 dB) sits on top of the plan, for example about -6 dB on a vocal that
+  sits too far forward. **Follow Engine** off takes one channel out of the plan.
+- After a trim, Reset meters, play or render, and Apply again so the loudness still hits target.
+
+### The report
+
+Every balance writes `Documents\Strata\report.json`: each channel's role (and whether it was
+guessed), loudness, static offset, width and per-bar gain curve, plus the list of moments (bars,
+who is featured, who sits back). It is there so a person, or Claude, can check the balance from
+numbers.
 
 ## Meters
 
